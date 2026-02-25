@@ -4,7 +4,9 @@
 > Read plan for full context. Update after each phase.
 
 ## Branch
-`strictly-check/reliability` (from main at 7b81746)
+`strictly-check/reliability-001` (from main at 7b81746)
+
+Branch naming: `-001`, `-002`, ... (sequential). See CLAUDE.md § Reliability Work Branch Strategy.
 
 ## Progress Tracker
 

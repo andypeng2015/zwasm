@@ -1,7 +1,7 @@
 # zwasm Codebase Reliability Improvement — Execution Plan
 
 > Created: 2026-02-25
-> Branch: `strictly-check/reliability`
+> Branch: `strictly-check/reliability-NNN` (sequential, see Branch Strategy)
 > Origin: `private/20260225_strictly_check/01_plan.md` (user requirements)
 > Handover: `.dev/reliability-handover.md`
 
@@ -172,11 +172,35 @@ Implementation first, docs update if truly infeasible.
 
 ---
 
+## Branch Strategy
+
+**Incremental merge to main** — users are actively depending on main.
+
+- Branches: `strictly-check/reliability-001`, `-002`, `-003`, ...
+- Each branch targets a **regression-free improvement unit** (e.g., one bug fix, one new test suite)
+- Workflow per branch:
+  1. Work on `strictly-check/reliability-NNN`
+  2. When improvement is complete and regression-free (tests pass, no perf regression):
+     - Merge to main (fast-forward or merge commit)
+     - `git push origin main`
+  3. Create next branch: `git checkout -b strictly-check/reliability-NNN+1 main`
+  4. Continue from handover
+
+**Merge criteria** (same as Merge Gate in CLAUDE.md):
+  1. `zig build test` passes
+  2. `python3 test/spec/run_spec.py --build --summary` passes (if opcodes/interpreter changed)
+  3. `bash bench/run_bench.sh --quick` — no regression
+  4. New real-world compat tests pass (if added)
+
 ## Execution Order
 
 ```
 A (env) → B (compile) → C (compat) + D (e2e) → E (bench) → F (perf) → G (ubuntu) → H (docs)
 ```
+
+Phases are not strictly sequential — merge to main at any point when a
+regression-free improvement is ready. For example, fixing W34 in Phase C.2
+merits an immediate merge even if Phase D hasn't started.
 
 ## References
 

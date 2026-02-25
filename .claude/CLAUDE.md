@@ -161,6 +161,24 @@ Do not merge with known new regressions on either platform.
 
 Tag creation and CW release are manual — use `/release` when instructed.
 
+### Reliability Work Branch Strategy
+
+Active plan: `.dev/reliability-plan.md`. Progress: `.dev/reliability-handover.md`.
+
+**Incremental merge to main** — users are actively depending on main.
+Merge at each regression-free improvement boundary, not at stage end.
+
+- Branches: `strictly-check/reliability-001`, `-002`, `-003`, ...
+- Each branch targets a **regression-free improvement unit** (e.g., one bug fix, one test suite)
+- Workflow per branch:
+  1. Work on `strictly-check/reliability-NNN`
+  2. When improvement is complete and passes Merge Gate:
+     - Merge to main: `git checkout main && git merge strictly-check/reliability-NNN`
+     - Push: `git push origin main`
+  3. Create next branch: `git checkout -b strictly-check/reliability-NNN+1 main`
+  4. Update `.dev/reliability-handover.md` with new branch name
+  5. Continue from handover
+
 ### Stage Completion
 
 When Task Queue for current stage is all `[x]`:
