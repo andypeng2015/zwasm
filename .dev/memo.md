@@ -15,18 +15,18 @@ Session handover document. Read at session start.
 Reliability improvement (branch: `strictly-check/reliability-003`).
 Plan: `@./.dev/reliability-plan.md`. Progress: `@./.dev/reliability-handover.md`.
 
-Phases A-G complete. I.1-I.7 complete (E2E 100%).
-**Next**: I.0 (FP precision), Phase J (x86_64 JIT), K (perf), H (docs).
+Phases A-I complete. E2E 792/792 (100%), FP precision fixed.
+**Next**: Phase J (x86_64 JIT), K (perf), H (docs).
 
 ## Previous Task
 
-I.1-I.7: E2E 792/792 (100%). Funcref validation, import type checking,
-memory64 bulk ops, GC alloc guard, externref encoding, thread support.
+I.0-I.7: Phase I complete. FP precision fix (JIT getOrLoad dirty FP cache),
+E2E 792/792 (100%), all real-world C/C++/Rust match wasmtime exactly.
 
 ## Known Bugs
 
 - x86_64 JIT: 6 real-world programs crash/OOB on Ubuntu (pass without JIT)
-- FP precision: c_math_compute differs from wasmtime (IEEE 754 bug)
+- Go WASI: 3 Go programs produce no output (WASI compatibility, not JIT-related)
 
 ## References
 

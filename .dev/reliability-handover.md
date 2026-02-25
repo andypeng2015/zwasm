@@ -10,13 +10,11 @@
 ### ✅ Completed
 - A-F: Environment, compilation, compat, E2E expansion, benchmarks, analysis, W34 fix
 - G.1-G.3: Ubuntu spec 62,158/62,158 (100%). Real-world: all pass without JIT, 6/9 fail with JIT → Phase J
-- I.1-I.7: E2E 792/792 (100%). Funcref validation, import type checking, memory64 bulk ops,
+- I.0-I.7: E2E 792/792 (100%). FP precision fix (JIT getOrLoad dirty FP cache),
+  funcref validation, import type checking, memory64 bulk ops,
   GC array alloc guard, externref encoding, thread/wait sequential simulation.
 
 ### Active / TODO
-
-**Phase I: FP correctness (remaining)**
-- [ ] I.0: FP precision root cause (c_math_compute diff — bug, not acceptable)
 
 **Phase J: x86_64 JIT bug fixes**
 - [ ] J.1: Investigate x86_64 JIT codegen crash patterns
@@ -38,10 +36,10 @@
 
 ## Next session: start here
 
-1. **I.0: FP precision** — investigate c_math_compute diff vs wasmtime.
-2. **Phase J: x86_64 JIT** — investigate and fix 6 real-world crashes on Ubuntu.
-3. **G.4: Ubuntu benchmarks** — run `bash bench/run_bench.sh --quick` in background.
-4. After J: Phase K (performance), then Phase H (documentation).
+1. **Phase J: x86_64 JIT** — investigate and fix 6 real-world crashes on Ubuntu.
+   Apply same getOrLoad fix to x86.zig if applicable.
+2. **G.4: Ubuntu benchmarks** — run `bash bench/run_bench.sh --quick` in background.
+3. After J: Phase K (performance), then Phase H (documentation).
 
 ## x86_64 JIT failures (Phase J input)
 All PASS with `--profile` (JIT disabled). Failures with JIT:
