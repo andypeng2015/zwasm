@@ -10,18 +10,13 @@
 ### ✅ Completed
 - A-F: Environment, compilation, compat, E2E expansion, benchmarks, analysis, W34 fix
 - G.1-G.3: Ubuntu spec 62,158/62,158 (100%). Real-world: all pass without JIT, 6/9 fail with JIT → Phase J
+- I.1-I.7: E2E 792/792 (100%). Funcref validation, import type checking, memory64 bulk ops,
+  GC array alloc guard, externref encoding, thread/wait sequential simulation.
 
 ### Active / TODO
 
-**Phase I: E2E 100% + FP correctness**
+**Phase I: FP correctness (remaining)**
 - [ ] I.0: FP precision root cause (c_math_compute diff — bug, not acceptable)
-- [ ] I.1: Typed funcref validation (30 assert_invalid)
-- [ ] I.2: Import type checking (7 assert_unlinkable)
-- [ ] I.3: Memory64 bounds edge cases (9 failures)
-- [ ] I.4: GC ref.test type combinations (2 failures)
-- [ ] I.5: GC array-alloc-too-large (2 failures)
-- [ ] I.6: Memory64 linking validation (3 failures)
-- [ ] I.7: Threads SB_atomic ordering (1 failure)
 
 **Phase J: x86_64 JIT bug fixes**
 - [ ] J.1: Investigate x86_64 JIT codegen crash patterns
@@ -43,14 +38,10 @@
 
 ## Next session: start here
 
-1. **Commit** the uncommitted plan/doc/script changes on `strictly-check/reliability-003`
-   (reliability-plan.md, reliability-handover.md, memo.md, bench/run_bench.sh,
-   .claude/rules/reliability-work.md — plan revision, no code changes)
-2. **G.4: Ubuntu benchmarks** — not yet completed (previous SSH timed out).
-   Re-run: `ssh ubuntu ... bash bench/run_bench.sh --quick` in background.
-   Do NOT wait — proceed to Phase I or J while it runs.
-3. **Start Phase I or J** (whichever is easiest to unblock first).
-   I and J can proceed in parallel. See plan for task details.
+1. **I.0: FP precision** — investigate c_math_compute diff vs wasmtime.
+2. **Phase J: x86_64 JIT** — investigate and fix 6 real-world crashes on Ubuntu.
+3. **G.4: Ubuntu benchmarks** — run `bash bench/run_bench.sh --quick` in background.
+4. After J: Phase K (performance), then Phase H (documentation).
 
 ## x86_64 JIT failures (Phase J input)
 All PASS with `--profile` (JIT disabled). Failures with JIT:
