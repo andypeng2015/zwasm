@@ -3556,29 +3556,35 @@ pub const Vm = struct {
         trace: ?*trace_mod.TraceConfig,
         min_memory_bytes: u32,
         use_guard_pages: bool,
+        back_edge_target: u32,
     ) WasmError!void {
         count.* += 1;
         if (count.* == jit_mod.BACK_EDGE_THRESHOLD) {
             // Functions with reentry guards (C/C++ init patterns like __cxa_atexit)
-            // cannot be re-entered from pc=0 after JitRestart (guard triggers unreachable),
-            // and OSR mid-function entry is unreliable. Skip back-edge JIT for these;
-            // they run fast enough on the register IR interpreter.
+            // cannot be re-entered from pc=0 after JitRestart (guard triggers unreachable).
             if (hasReentryGuard(reg.code)) {
                 wf.jit_failed = true;
                 if (trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "reentry guard — skip back-edge JIT");
                 return;
             }
-            // Functions with calls, call_indirect, or global.set cannot be safely
-            // restarted from pc=0 — their side effects (memory writes via callees,
-            // global state changes) would be re-executed, corrupting program state.
-            // Go WASM state-machine functions (e.g. moduledataverify1) are the
-            // primary case: 1000+ loop iterations modify Go's SP and heap.
-            if (hasNonRestartableSideEffects(reg.code)) {
+            // Same IR limit as normal path — large functions produce incorrect JIT code
+            if (reg.code.len > jit_mod.MAX_JIT_IR_INSTRS) {
                 wf.jit_failed = true;
-                if (trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "side effects — skip back-edge JIT");
+                if (trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "too many IR instrs — skip back-edge JIT");
                 return;
             }
-            wf.jit_code = jit_mod.compileFunction(alloc, reg, pool64, wf.func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages, null);
+            // Go state machines use br_table for dispatch — OSR can't help because
+            // the state dispatch itself is the problem. Bail completely.
+            if (hasBrTableInPrologue(reg.code, back_edge_target)) {
+                wf.jit_failed = true;
+                if (trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "br_table in prologue — skip back-edge JIT");
+                return;
+            }
+            // For call/global.set in prologue: restart from pc=0 would double-allocate
+            // or corrupt stack pointer. Use OSR to enter at the loop body instead.
+            const use_osr = hasPrologueSideEffects(reg.code, back_edge_target);
+            const osr_pc: ?u32 = if (use_osr) back_edge_target else null;
+            wf.jit_code = jit_mod.compileFunction(alloc, reg, pool64, wf.func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages, osr_pc);
             if (wf.jit_code != null) {
                 if (trace) |tc| trace_mod.traceJitBackEdge(tc, wf.func_idx, @intCast(reg.code.len), @intCast(wf.jit_code.?.buf.len));
                 return error.JitRestart;
@@ -3588,12 +3594,11 @@ pub const Vm = struct {
         }
     }
 
-    /// Detect functions unsafe for back-edge JIT restart from pc=0.
-    /// Functions with calls, call_indirect, or global.set have observable side
-    /// effects that would be re-executed on restart, corrupting program state.
-    /// (Go WASM state-machine functions are the primary case.)
-    fn hasNonRestartableSideEffects(ir: []const regalloc_mod.RegInstr) bool {
-        for (ir) |instr| {
+    /// Check if prologue has call/global.set that make restart from pc=0 unsafe.
+    /// These are safe with OSR (enter at loop body, skip prologue).
+    fn hasPrologueSideEffects(ir: []const regalloc_mod.RegInstr, loop_header: u32) bool {
+        const limit = @min(ir.len, loop_header);
+        for (ir[0..limit]) |instr| {
             switch (instr.op) {
                 regalloc_mod.OP_CALL,
                 regalloc_mod.OP_CALL_INDIRECT,
@@ -3601,6 +3606,17 @@ pub const Vm = struct {
                 => return true,
                 else => {},
             }
+        }
+        return false;
+    }
+
+    /// Check if prologue has br_table (Go state machine dispatch pattern).
+    /// Includes the instruction AT the back-edge target: Go back-edges jump
+    /// directly to the br_table for state dispatch (target == br_table PC).
+    fn hasBrTableInPrologue(ir: []const regalloc_mod.RegInstr, loop_header: u32) bool {
+        const limit = @min(ir.len, loop_header + 1);
+        for (ir[0..limit]) |instr| {
+            if (instr.op == regalloc_mod.OP_BR_TABLE) return true;
         }
         return false;
     }
@@ -3684,14 +3700,14 @@ pub const Vm = struct {
                 // ---- Control flow ----
                 regalloc_mod.OP_BR => {
                     if (jit_eligible and instr.operand < pc)
-                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                     pc = instr.operand;
                 },
 
                 regalloc_mod.OP_BR_IF => {
                     if (regs[instr.rd] != 0) {
                         if (jit_eligible and instr.operand < pc)
-                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                         pc = instr.operand;
                     }
                 },
@@ -3699,7 +3715,7 @@ pub const Vm = struct {
                 regalloc_mod.OP_BR_IF_NOT => {
                     if (regs[instr.rd] == 0) {
                         if (jit_eligible and instr.operand < pc)
-                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                         pc = instr.operand;
                     }
                 },
@@ -4257,7 +4273,7 @@ pub const Vm = struct {
                     const target_entry = if (idx < count) idx else count; // default is last
                     const target_pc = code[pc + target_entry].operand;
                     if (jit_eligible and target_pc < pc)
-                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, target_pc);
                     pc = target_pc;
                     continue;
                 },
@@ -7970,34 +7986,66 @@ test "Resource limits — fuel metering" {
     try testing.expectError(error.FuelExhausted, vm.invoke(&inst, "memory_size", &.{}, &results));
 }
 
-test "Back-edge JIT — hasNonRestartableSideEffects" {
+test "Back-edge JIT — hasPrologueSideEffects" {
     const R = regalloc_mod.RegInstr;
 
-    // Pure loop (i32.add + br_if) — safe to restart
+    // Pure prologue (const + add) with loop at pc=2 — safe
     const pure = [_]R{
         .{ .op = regalloc_mod.OP_ADDI32, .rd = 0, .rs1 = 0, .operand = 1 },
-        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 0 },
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 10 },
+        .{ .op = regalloc_mod.OP_ADDI32, .rd = 0, .rs1 = 0, .operand = 1 }, // loop body
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 2 },
     };
-    try testing.expect(!Vm.hasNonRestartableSideEffects(&pure));
+    try testing.expect(!Vm.hasPrologueSideEffects(&pure, 2)); // loop header at pc=2
 
-    // Function with call — NOT safe to restart
-    const with_call = [_]R{
-        .{ .op = regalloc_mod.OP_ADDI32, .rd = 0, .rs1 = 0, .operand = 1 },
+    // Call in prologue (before loop header) — NOT safe
+    const call_in_prologue = [_]R{
         .{ .op = regalloc_mod.OP_CALL, .rd = 0, .rs1 = 0, .operand = 42 },
-        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 0 },
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 10 },
+        .{ .op = regalloc_mod.OP_ADDI32, .rd = 0, .rs1 = 0, .operand = 1 }, // loop body
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 2 },
     };
-    try testing.expect(Vm.hasNonRestartableSideEffects(&with_call));
+    try testing.expect(Vm.hasPrologueSideEffects(&call_in_prologue, 2));
 
-    // Function with global.set — NOT safe to restart
-    const with_global_set = [_]R{
+    // Call INSIDE loop body (after loop header) — safe
+    const call_in_body = [_]R{
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 10 },
+        .{ .op = regalloc_mod.OP_ADDI32, .rd = 0, .rs1 = 0, .operand = 1 }, // loop body
+        .{ .op = regalloc_mod.OP_CALL, .rd = 0, .rs1 = 0, .operand = 42 },  // call in body
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 1 },
+    };
+    try testing.expect(!Vm.hasPrologueSideEffects(&call_in_body, 1));
+
+    // global.set in prologue — NOT safe
+    const gset_in_prologue = [_]R{
         .{ .op = 0x24, .rd = 0, .rs1 = 0, .operand = 0 }, // global.set
         .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 0 },
     };
-    try testing.expect(Vm.hasNonRestartableSideEffects(&with_global_set));
+    try testing.expect(Vm.hasPrologueSideEffects(&gset_in_prologue, 1));
 
-    // Function with call_indirect — NOT safe to restart
-    const with_call_indirect = [_]R{
-        .{ .op = regalloc_mod.OP_CALL_INDIRECT, .rd = 0, .rs1 = 0, .operand = 0 },
+    // Loop at pc=0 (no prologue) — always safe
+    const no_prologue = [_]R{
+        .{ .op = regalloc_mod.OP_CALL, .rd = 0, .rs1 = 0, .operand = 42 },
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 0 },
     };
-    try testing.expect(Vm.hasNonRestartableSideEffects(&with_call_indirect));
+    try testing.expect(!Vm.hasPrologueSideEffects(&no_prologue, 0));
+
+    // br_table is NOT detected by hasPrologueSideEffects (separate check)
+    const brtable_prologue = [_]R{
+        .{ .op = regalloc_mod.OP_BR_TABLE, .rd = 0, .rs1 = 0, .operand = 3 },
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 10 },
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 0 },
+    };
+    try testing.expect(!Vm.hasPrologueSideEffects(&brtable_prologue, 2));
+    try testing.expect(Vm.hasBrTableInPrologue(&brtable_prologue, 2));
+    try testing.expect(!Vm.hasBrTableInPrologue(&pure, 2)); // pure prologue
+
+    // Go pattern: back-edge targets the br_table itself (target == br_table PC)
+    const go_state_machine = [_]R{
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 0, .rs1 = 0, .operand = 0 }, // global.get
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 0 }, // mov
+        .{ .op = regalloc_mod.OP_BR_TABLE, .rd = 0, .rs1 = 0, .operand = 3 }, // br_table at pc=2
+        .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 2 }, // back-edge to pc=2
+    };
+    try testing.expect(Vm.hasBrTableInPrologue(&go_state_machine, 2)); // target=2, br_table at pc=2
 }

@@ -1641,6 +1641,17 @@ pub const Compiler = struct {
             self.emitLoadMemCache();
         }
 
+        // Load ALL physically-mapped vregs from register file.
+        // Unlike normal prologue (which uses prologue_load_mask), OSR must load all
+        // because we're entering mid-function with interpreter's register state.
+        const max: u8 = @intCast(@min(self.reg_count, MAX_PHYS_REGS));
+        for (0..max) |i| {
+            const vreg: u16 = @intCast(i);
+            if (vregToPhys(vreg)) |phys| {
+                Enc.loadDisp32(&self.code, self.alloc, phys, REGS_PTR, @as(i32, vreg) * 8);
+            }
+        }
+
         // Jump to the loop body at pc_map[target_pc]
         const target_offset = self.pc_map.items[target_pc];
         const jmp_patch_off = Enc.jmpRel32(&self.code, self.alloc);

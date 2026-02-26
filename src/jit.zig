@@ -2037,6 +2037,15 @@ pub const Compiler = struct {
         self.emit(a64.stpPre(25, 26, 31, -2)); // stp x25, x26, [sp, #-16]!
         self.emit(a64.stpPre(27, 28, 31, -2)); // stp x27, x28, [sp, #-16]!
 
+        // Must match normal prologue: save FP callee-saved D8-D15 for non-self-call.
+        // The shared epilogue pops these, so OSR must push them too.
+        if (!self.has_self_call) {
+            self.emit(a64.stpFpPre(8, 9, 31, -2));
+            self.emit(a64.stpFpPre(10, 11, 31, -2));
+            self.emit(a64.stpFpPre(12, 13, 31, -2));
+            self.emit(a64.stpFpPre(14, 15, 31, -2));
+        }
+
         // Self-call marker: x29 = SP (nonzero = normal entry, full epilogue)
         if (self.has_self_call) {
             self.emit(a64.addImm64(29, 31, 0)); // MOV x29, SP
