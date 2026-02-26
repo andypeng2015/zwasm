@@ -1196,6 +1196,9 @@ pub const Compiler = struct {
     self_call_only: bool,
     self_call_entry_offset: u32,
     self_func_idx: u32,
+    /// IR PC of reentry guard branch (br_if/br_if_not → unreachable in first 8 instrs).
+    /// When set, the JIT skips this branch so JitRestart doesn't trigger the guard trap.
+    guard_branch_pc: ?u32,
     param_count: u16,
     result_count: u16,
     reg_ptr_offset: u32,
@@ -1209,6 +1212,10 @@ pub const Compiler = struct {
     use_guard_pages: bool,
     /// Byte offset of the shared error epilogue (for signal handler recovery).
     shared_exit_offset: u32,
+    /// OSR target IR PC (for back-edge JIT with reentry guard).
+    osr_target_pc: ?u32,
+    /// Byte offset of the OSR prologue in the code buffer.
+    osr_prologue_offset: u32,
     /// IR slice and branch targets for peephole fusion (set during compile).
     ir_slice: []const RegInstr = &.{},
     branch_targets_slice: []bool = &.{},
@@ -1251,6 +1258,7 @@ pub const Compiler = struct {
             .self_call_only = false,
             .self_call_entry_offset = 0,
             .self_func_idx = 0,
+            .guard_branch_pc = null,
             .param_count = 0,
             .result_count = 0,
             .reg_ptr_offset = 0,
@@ -1261,6 +1269,8 @@ pub const Compiler = struct {
             .scratch_vreg = null,
             .use_guard_pages = false,
             .shared_exit_offset = 0,
+            .osr_target_pc = null,
+            .osr_prologue_offset = 0,
         };
     }
 
@@ -1592,6 +1602,49 @@ pub const Compiler = struct {
                 Enc.patchRel32(self.code.items, stub.rel32_offset, stub_offset);
             }
         }
+    }
+
+    /// Emit OSR (On-Stack Replacement) prologue: a second entry point that sets up
+    /// callee-saved registers and jumps directly to the loop body at osr_target_pc.
+    /// Used for back-edge JIT of functions with reentry guards (C/C++ init patterns).
+    fn emitOsrPrologue(self: *Compiler, target_pc: u32) void {
+        self.osr_prologue_offset = self.currentOffset();
+
+        // Same callee-saved pushes as normal prologue (must match epilogue)
+        Enc.pushReg(&self.code, self.alloc, .rbp);
+        Enc.pushReg(&self.code, self.alloc, .rbx);
+        Enc.pushReg(&self.code, self.alloc, .r12);
+        Enc.pushReg(&self.code, self.alloc, .r13);
+        Enc.pushReg(&self.code, self.alloc, .r14);
+        Enc.pushReg(&self.code, self.alloc, .r15);
+
+        // Sub 8 to restore 16-byte alignment (6 pushes = 48 bytes + 8 from CALL = 56, +8 = 64)
+        Enc.subImm32(&self.code, self.alloc, .rsp, 8);
+
+        // Marker [RSP] = 1 (normal entry — epilogue does full restore)
+        if (self.has_self_call) {
+            self.emitLoadImm32(SCRATCH2, 1);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 0, SCRATCH2);
+        }
+
+        // R12 = REGS_PTR (arg0 = RDI)
+        Enc.movRegReg(&self.code, self.alloc, REGS_PTR, .rdi);
+
+        // Store VM pointer (RSI) and Instance pointer (RDX) to register file slots
+        const vm_disp: i32 = (@as(i32, self.reg_count) + 2) * 8;
+        const inst_disp: i32 = (@as(i32, self.reg_count) + 3) * 8;
+        Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, vm_disp, .rsi);
+        Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, inst_disp, .rdx);
+
+        // Load memory cache (if function uses memory)
+        if (self.has_memory) {
+            self.emitLoadMemCache();
+        }
+
+        // Jump to the loop body at pc_map[target_pc]
+        const target_offset = self.pc_map.items[target_pc];
+        const jmp_patch_off = Enc.jmpRel32(&self.code, self.alloc);
+        Enc.patchRel32(self.code.items, jmp_patch_off, target_offset);
     }
 
     // --- Pointer helpers ---
@@ -2954,6 +3007,10 @@ pub const Compiler = struct {
             .entry = @ptrCast(@alignCast(aligned_buf.ptr)),
             .code_len = @intCast(code_size),
             .oob_exit_offset = self.shared_exit_offset,
+            .osr_entry = if (self.osr_prologue_offset > 0)
+                @ptrCast(@alignCast(aligned_buf.ptr + self.osr_prologue_offset))
+            else
+                null,
         };
         return jit_code;
     }
@@ -3014,6 +3071,20 @@ pub const Compiler = struct {
         self.has_self_call = found_self_call;
         self.self_call_only = found_self_call and !found_other_call;
 
+        // Detect reentry guard: early branch to unreachable in first 8 IR instructions.
+        // JitRestart re-executes from pc=0; guard already passed, so skip it in JIT code.
+        const guard_limit = @min(reg_func.code.len, 8);
+        for (reg_func.code[0..guard_limit], 0..) |ginstr, gi| {
+            if (ginstr.op == regalloc_mod.OP_BR_IF_NOT or ginstr.op == regalloc_mod.OP_BR_IF) {
+                const target = ginstr.operand;
+                if (target < reg_func.code.len and reg_func.code[target].op == 0x00) {
+                    self.guard_branch_pc = @intCast(gi);
+                    break;
+                }
+            }
+        }
+
+
         self.emitPrologue();
 
         const ir = reg_func.code;
@@ -3054,6 +3125,13 @@ pub const Compiler = struct {
 
         self.emitErrorStubs();
         self.patchBranches() catch return null;
+
+        // Emit OSR prologue if requested (for back-edge JIT with reentry guard)
+        if (self.osr_target_pc) |target_pc| {
+            if (target_pc < self.pc_map.items.len) {
+                self.emitOsrPrologue(target_pc);
+            }
+        }
 
         return self.finalize();
     }
@@ -3106,6 +3184,17 @@ pub const Compiler = struct {
             },
             regalloc_mod.OP_RETURN_VOID => self.emitEpilogue(null),
             regalloc_mod.OP_NOP, regalloc_mod.OP_BLOCK_END, regalloc_mod.OP_DELETED => {},
+
+            // --- Unreachable ---
+            0x00 => {
+                // MOV EAX, 5 (Unreachable error) + JMP to shared exit
+                Enc.movImm32ToReg(&self.code, self.alloc, .rax, 5);
+                const jmp_off = Enc.jmpRel32(&self.code, self.alloc);
+                self.error_stubs.append(self.alloc, .{
+                    .rel32_offset = jmp_off,
+                    .error_code = 0, // RAX already set, patch JMP to shared exit
+                }) catch return false;
+            },
 
             // --- Select ---
             0x1B => { // select: rd = cond ? val1 : val2
@@ -4059,6 +4148,7 @@ pub fn compileFunction(
     trace: ?*trace_mod.TraceConfig,
     min_memory_bytes: u32,
     use_guard_pages: bool,
+    osr_target_pc: ?u32,
 ) ?*JitCode {
     if (builtin.cpu.arch != .x86_64) return null;
     _ = trace;
@@ -4076,6 +4166,7 @@ pub fn compileFunction(
 
     var compiler = Compiler.init(alloc);
     compiler.use_guard_pages = use_guard_pages;
+    compiler.osr_target_pc = osr_target_pc;
     defer compiler.deinit();
 
     return compiler.compile(
@@ -4217,7 +4308,7 @@ test "x86_64 compile and execute constant return" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4243,7 +4334,7 @@ test "x86_64 compile and execute i32 add" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4276,7 +4367,7 @@ test "x86_64 compile and execute branch (LE_S + BR_IF_NOT)" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4326,7 +4417,7 @@ test "x86_64 compile and execute loop (simple counter)" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 1, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 1, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4382,7 +4473,7 @@ test "x86_64 compile and execute memory load" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 1, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 1, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4444,7 +4535,7 @@ test "x86_64 compile and execute memory store then load" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4474,7 +4565,7 @@ test "x86_64 compile and execute f64 add" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 2, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4519,11 +4610,11 @@ test "x86_64 CMP+Jcc fusion saves instructions per compare-and-branch" {
     var reg_func = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 4, .local_count = 2, .alloc = alloc };
     var reg_func_nofuse = RegFunc{ .code = &code_nofuse, .pool64 = &.{}, .reg_count = 4, .local_count = 2, .alloc = alloc };
 
-    const jit_fused = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_fused = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_fused.deinit(alloc);
 
-    const jit_nofuse = compileFunction(alloc, &reg_func_nofuse, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_nofuse = compileFunction(alloc, &reg_func_nofuse, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_nofuse.deinit(alloc);
 
@@ -4545,4 +4636,41 @@ test "x86_64 CMP+Jcc fusion saves instructions per compare-and-branch" {
 
     // Fusion check: fused code should be shorter
     try testing.expect(jit_fused.code_len < jit_nofuse.code_len);
+}
+
+test "x86_64 unreachable opcode emits trap error" {
+    if (builtin.cpu.arch != .x86_64) return;
+
+    const alloc = testing.allocator;
+
+    // IR: if arg == 0, return 42; otherwise, fall through to unreachable.
+    // [0] BR_IF_NOT r0, target=2 → if arg == 0, skip to return
+    // [1] unreachable (0x00)
+    // [2] CONST32 r1, 42
+    // [3] RETURN r1
+    var code = [_]RegInstr{
+        .{ .op = regalloc_mod.OP_BR_IF_NOT, .rd = 0, .rs1 = 0, .operand = 2 },
+        .{ .op = 0x00, .rd = 0, .rs1 = 0, .operand = 0 }, // unreachable
+        .{ .op = regalloc_mod.OP_CONST32, .rd = 1, .rs1 = 0, .operand = 42 },
+        .{ .op = regalloc_mod.OP_RETURN, .rd = 1, .rs1 = 0, .operand = 0 },
+    };
+    var rf = RegFunc{ .code = &code, .reg_count = 4, .local_count = 2 };
+    const jit_code = compileFunction(alloc, &rf, &.{}, 0, 1, 1, null, 0, false, null) orelse
+        return error.SkipZigTest;
+    defer jit_code.deinit(alloc);
+
+    // arg=0: branch skips unreachable, returns 42
+    {
+        var regs = [_]u64{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        const result = jit_code.entry(&regs, undefined, undefined);
+        try testing.expectEqual(@as(u64, 0), result);
+        try testing.expectEqual(@as(u64, 42), regs[0]);
+    }
+
+    // arg=1: falls through to unreachable, returns error code 5 (Unreachable)
+    {
+        var regs = [_]u64{ 1, 0, 0, 0, 0, 0, 0, 0 };
+        const result = jit_code.entry(&regs, undefined, undefined);
+        try testing.expectEqual(@as(u64, 5), result);
+    }
 }

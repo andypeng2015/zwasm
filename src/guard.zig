@@ -133,17 +133,13 @@ pub fn getRecovery() *RecoveryInfo {
 /// Must be called once at startup.
 pub fn installSignalHandler() void {
     const handler_fn = struct {
-        fn handler(_: i32, info: *const posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
+        fn handler(_: i32, _: *const posix.siginfo_t, ctx_ptr: ?*anyopaque) callconv(.c) void {
             const rec = getRecovery();
             if (!rec.active) {
                 // Not in JIT code — re-raise with default handler
                 resetAndReraise();
                 return;
             }
-            // Get faulting address
-            const fault_addr = getFaultAddress(info);
-            _ = fault_addr; // We trust that if we're in JIT code, the fault is from guard pages
-
             // Verify faulting PC is within JIT code buffer
             // Kernel may place ucontext at non-16-byte-aligned address.
             const ctx: *align(1) posix.ucontext_t = @ptrCast(ctx_ptr.?);
@@ -153,6 +149,7 @@ pub fn installSignalHandler() void {
                 resetAndReraise();
                 return;
             }
+
 
             // Redirect execution to OOB error return
             setPc(ctx, rec.oob_exit_pc);

@@ -45,6 +45,10 @@ pub const JitCode = struct {
     code_len: u32,
     /// Offset of the OOB error return stub within buf (for signal handler recovery).
     oob_exit_offset: u32 = 0,
+    /// OSR (On-Stack Replacement) entry: alternative entry point that jumps to a
+    /// loop body, bypassing the function's init section. Used for back-edge JIT
+    /// of functions with reentry guards (C/C++ init patterns).
+    osr_entry: ?JitFn = null,
 
     pub fn deinit(self: *JitCode, alloc: Allocator) void {
         std.posix.munmap(self.buf);
@@ -872,6 +876,13 @@ pub const Compiler = struct {
     /// Enables aggressive self-call optimization: skip reg_ptr memory sync.
     self_call_only: bool,
     self_func_idx: u32,
+    /// IR PC of reentry guard branch (br_if/br_if_not → unreachable in first 8 instrs).
+    /// When set, the JIT skips this branch so JitRestart doesn't trigger the guard trap.
+    guard_branch_pc: ?u32,
+    /// OSR target IR PC — emit a second entry point that jumps directly to this PC.
+    osr_target_pc: ?u32,
+    /// Instruction index of OSR prologue (for finalize to compute osr_entry offset).
+    osr_prologue_idx: u32,
     param_count: u16,
     result_count: u16,
     reg_ptr_offset: u32,
@@ -965,6 +976,9 @@ pub const Compiler = struct {
             .has_self_call = false,
             .self_call_only = false,
             .self_func_idx = 0,
+            .guard_branch_pc = null,
+            .osr_target_pc = null,
+            .osr_prologue_idx = 0,
             .param_count = 0,
             .result_count = 0,
             .reg_ptr_offset = 0,
@@ -1152,7 +1166,7 @@ pub const Compiler = struct {
     /// Allocate a D-register for an FP result. Returns the D register number.
     /// Marks the slot as dirty (value only in D-reg, not in GPR).
     fn fpAllocResult(self: *Compiler, vreg: u16) u5 {
-        // If vreg already cached, reuse slot (overwrite is fine)
+        // If vreg already cached, reuse slot (overwrite is fine — D-reg has valid value)
         if (self.fpCacheFind(vreg)) |slot| {
             self.fp_dreg_dirty[slot] = true;
             return fpSlotToDreg(slot);
@@ -1160,8 +1174,18 @@ pub const Compiler = struct {
         const slot = self.fpCacheAlloc();
         const dreg = fpSlotToDreg(slot);
         self.fp_dreg[slot] = vreg;
-        self.fp_dreg_dirty[slot] = true;
+        // Don't mark dirty yet — D-register doesn't have the new value.
+        // Caller MUST call fpMarkResultDirty(vreg) after the actual write.
+        // Without this, getOrLoad(rs1=rd) would materialize a stale D-reg value.
         return dreg;
+    }
+
+    /// Mark an FP cache entry as dirty after the D-register has been written.
+    /// Must be called after fpAllocResult for new entries.
+    fn fpMarkResultDirty(self: *Compiler, vreg: u16) void {
+        if (self.fpCacheFind(vreg)) |slot| {
+            self.fp_dreg_dirty[slot] = true;
+        }
     }
 
     /// Materialize an FP-cached vreg to GPR. Used when non-FP code needs the value.
@@ -1921,6 +1945,56 @@ pub const Compiler = struct {
         self.emit(a64.str64(28, SCRATCH, 8)); // vm.call_depth = x28
     }
 
+    /// Emit OSR (On-Stack Replacement) prologue: a second entry point that sets up
+    /// callee-saved registers and jumps directly to the loop body at osr_target_pc.
+    /// Used for back-edge JIT of functions with reentry guards (C/C++ init patterns).
+    fn emitOsrPrologue(self: *Compiler, target_pc: u32) void {
+        self.osr_prologue_idx = self.currentIdx();
+
+        // Same callee-saved pushes as normal prologue (must match epilogue)
+        self.emit(a64.stpPre(29, 30, 31, -2)); // stp x29, x30, [sp, #-16]!
+        self.emit(a64.stpPre(19, 20, 31, -2)); // stp x19, x20, [sp, #-16]!
+        self.emit(a64.stpPre(21, 22, 31, -2)); // stp x21, x22, [sp, #-16]!
+        self.emit(a64.stpPre(23, 24, 31, -2)); // stp x23, x24, [sp, #-16]!
+        self.emit(a64.stpPre(25, 26, 31, -2)); // stp x25, x26, [sp, #-16]!
+        self.emit(a64.stpPre(27, 28, 31, -2)); // stp x27, x28, [sp, #-16]!
+
+        // Self-call marker: x29 = SP (nonzero = normal entry, full epilogue)
+        if (self.has_self_call) {
+            self.emit(a64.addImm64(29, 31, 0)); // MOV x29, SP
+        }
+
+        // x19 (REGS_PTR) = x0 (first arg: register file pointer)
+        self.emit(a64.mov64(REGS_PTR, 0));
+
+        // Store VM pointer (x1) and Instance pointer (x2) to register file slots
+        self.emit(a64.str64(1, REGS_PTR, @intCast((@as(u32, self.reg_count) + 2) * 8)));
+        self.emit(a64.str64(2, REGS_PTR, @intCast((@as(u32, self.reg_count) + 3) * 8)));
+
+        // Load memory cache (if function uses memory)
+        // Must be BEFORE loading vregs — BLR trashes caller-saved (x0-x18).
+        if (self.has_memory) {
+            self.emitLoadMemCache();
+        }
+
+        // Load ALL physically-mapped vregs from register file.
+        // Unlike normal prologue (which uses prologue_load_mask), OSR must load all
+        // because we're entering mid-function with interpreter's register state.
+        const max: u8 = @intCast(@min(self.reg_count, MAX_PHYS_REGS));
+        for (0..max) |i| {
+            const vreg: u16 = @intCast(i);
+            if (vregToPhys(vreg)) |phys| {
+                self.emit(a64.ldr64(phys, REGS_PTR, @as(u16, vreg) * 8));
+            }
+        }
+
+        // Jump to the loop body at pc_map[target_pc]
+        const target_idx = self.pc_map.items[target_pc];
+        const current = self.currentIdx();
+        const disp: i26 = @intCast(@as(i32, @intCast(target_idx)) - @as(i32, @intCast(current)));
+        self.emit(a64.b(disp));
+    }
+
     /// Reload x28 (depth counter) from vm.call_depth after trampoline calls.
     fn emitDepthReload(self: *Compiler) void {
         const rp_slot: u16 = @intCast(@as(u32, self.reg_count) * 8);
@@ -2047,6 +2121,19 @@ pub const Compiler = struct {
         self.has_self_call = found_self_call;
         self.self_call_only = found_self_call and !found_other_call;
 
+        // Detect reentry guard: early branch to unreachable in first 8 IR instructions.
+        // JitRestart re-executes from pc=0; guard already passed, so skip it in JIT code.
+        const guard_limit = @min(reg_func.code.len, 8);
+        for (reg_func.code[0..guard_limit], 0..) |ginstr, gi| {
+            if (ginstr.op == regalloc_mod.OP_BR_IF_NOT or ginstr.op == regalloc_mod.OP_BR_IF) {
+                const target = ginstr.operand;
+                if (target < reg_func.code.len and reg_func.code[target].op == 0x00) {
+                    self.guard_branch_pc = @intCast(gi);
+                    break;
+                }
+            }
+        }
+
         // Pre-scan: compute which vregs need loading in prologue
         self.prologue_load_mask = computePrologueLoads(self.local_count);
 
@@ -2123,6 +2210,13 @@ pub const Compiler = struct {
 
         // Patch forward branches
         self.patchBranches() catch return null;
+
+        // Emit OSR prologue if requested (for back-edge JIT with reentry guard)
+        if (self.osr_target_pc) |target_pc| {
+            if (target_pc < self.pc_map.items.len) {
+                self.emitOsrPrologue(target_pc);
+            }
+        }
 
         // Finalize: copy to executable memory
         return self.finalize();
@@ -3187,6 +3281,7 @@ pub const Compiler = struct {
         if (self.isConstAddrSafe(instr.rs1, instr.operand, 8)) |eff_addr| {
             self.emitLoadImm(SCRATCH, eff_addr);
             self.emit(a64.ldrFp64Reg(dreg, MEM_BASE, SCRATCH));
+            self.fpMarkResultDirty(instr.rd);
             return;
         }
 
@@ -3204,6 +3299,7 @@ pub const Compiler = struct {
 
         // 3. Load directly to D-register (no GPR intermediate)
         self.emit(a64.ldrFp64Reg(dreg, MEM_BASE, SCRATCH));
+        self.fpMarkResultDirty(instr.rd);
         self.scratch_vreg = null;
     }
 
@@ -3273,13 +3369,14 @@ pub const Compiler = struct {
         const addr_instrs = a64.loadImm64(SCRATCH, self.global_get_addr);
         for (addr_instrs) |inst| self.emit(inst);
         self.emit(a64.blr(SCRATCH));
-        // Reload caller-saved FIRST (x0 is untouched), then write result
+        // Store result to regs[rd] BEFORE reload — x0 may be overwritten by
+        // vreg 20 reload when reg_count > 20 (same pattern as emitMemGrow).
+        self.emit(a64.str64(0, REGS_PTR, @as(u16, instr.rd) * 8));
         self.reloadCallerSaved();
-        const d = destReg(instr.rd);
-        self.emit(a64.mov64(d, 0));
-        self.storeVreg(instr.rd, d);
-        // BLR clobbered SCRATCH — if rd was physical, storeVreg didn't update cache
-        if (d != SCRATCH) self.scratch_vreg = null;
+        // Callee-saved destinations (0-4, 12-13) aren't reloaded by
+        // reloadCallerSaved; reload explicitly.
+        self.reloadVreg(instr.rd);
+        self.scratch_vreg = null;
     }
 
     /// global.set: call jitGlobalSet(instance, idx, val)
@@ -3860,6 +3957,7 @@ pub const Compiler = struct {
             else => unreachable,
         };
         self.emit(enc);
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64 binary with direct FP instruction (min/max).
@@ -3868,6 +3966,7 @@ pub const Compiler = struct {
         const dm = self.fpLoadToDreg(instr.rs2());
         const dd = self.fpAllocResult(instr.rd);
         self.emit(fpOp(dd, dn, dm));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64 unary (sqrt/abs/neg). Uses D-register cache.
@@ -3875,6 +3974,7 @@ pub const Compiler = struct {
         const dn = self.fpLoadToDreg(instr.rs1);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(fpOp(dd, dn));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64 comparison: FCMP + CSET. Inputs from D-cache, result is integer.
@@ -3953,6 +4053,7 @@ pub const Compiler = struct {
         const src = self.getOrLoad(instr.rs1, SCRATCH);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(0x1E620000 | (@as(u32, src) << 5) | @as(u32, dd));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64.convert_i32_u: UCVTF Dd, Wn
@@ -3960,6 +4061,7 @@ pub const Compiler = struct {
         const src = self.getOrLoad(instr.rs1, SCRATCH);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(0x1E630000 | (@as(u32, src) << 5) | @as(u32, dd));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64.convert_i64_s: SCVTF Dd, Xn
@@ -3967,6 +4069,7 @@ pub const Compiler = struct {
         const src = self.getOrLoad(instr.rs1, SCRATCH);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(0x9E620000 | (@as(u32, src) << 5) | @as(u32, dd));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64.convert_i64_u: UCVTF Dd, Xn
@@ -3974,6 +4077,7 @@ pub const Compiler = struct {
         const src = self.getOrLoad(instr.rs1, SCRATCH);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(0x9E630000 | (@as(u32, src) << 5) | @as(u32, dd));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f64.promote_f32: FCVT Dd, Sn
@@ -3983,6 +4087,7 @@ pub const Compiler = struct {
         const dd = self.fpAllocResult(instr.rd);
         self.emit(a64.fmovToFp32(FP_SCRATCH0, src));
         self.emit(a64.fcvt_d_s(dd, FP_SCRATCH0));
+        self.fpMarkResultDirty(instr.rd);
     }
 
     /// f32.convert_i32_s: SCVTF Sd, Wn
@@ -4084,6 +4189,7 @@ pub const Compiler = struct {
         const dn = self.fpLoadToDreg(instr.rs1);
         const dd = self.fpAllocResult(instr.rd);
         self.emit(encoding | (@as(u32, dn) << 5) | dd);
+        self.fpMarkResultDirty(instr.rd);
     }
 
     fn emitFpRound32(self: *Compiler, encoding: u32, instr: RegInstr) void {
@@ -4389,6 +4495,10 @@ pub const Compiler = struct {
             .entry = @ptrCast(@alignCast(aligned_buf.ptr)),
             .code_len = @intCast(self.code.items.len * 4),
             .oob_exit_offset = self.shared_exit_idx * 4,
+            .osr_entry = if (self.osr_prologue_idx > 0)
+                @ptrCast(@alignCast(aligned_buf.ptr + self.osr_prologue_idx * 4))
+            else
+                null,
         };
         return jit_code;
     }
@@ -4646,6 +4756,8 @@ pub fn getUseGuardPages(instance: *Instance) bool {
 }
 
 /// param_count: number of parameters for the function.
+/// osr_target_pc: if non-null, emit an OSR entry that jumps to this IR PC
+/// (for back-edge JIT of functions with reentry guards).
 pub fn compileFunction(
     alloc: Allocator,
     reg_func: *RegFunc,
@@ -4656,11 +4768,12 @@ pub fn compileFunction(
     trace: ?*trace_mod.TraceConfig,
     min_memory_bytes: u32,
     use_guard_pages: bool,
+    osr_target_pc: ?u32,
 ) ?*JitCode {
     // x86_64 dispatch — delegate to separate backend
     if (builtin.cpu.arch == .x86_64) {
         const x86 = @import("x86.zig");
-        return x86.compileFunction(alloc, reg_func, pool64, self_func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages);
+        return x86.compileFunction(alloc, reg_func, pool64, self_func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages, osr_target_pc);
     }
 
     if (builtin.cpu.arch != .aarch64) return null;
@@ -4678,6 +4791,7 @@ pub fn compileFunction(
     var compiler = Compiler.init(alloc);
     compiler.min_memory_bytes = min_memory_bytes;
     compiler.use_guard_pages = use_guard_pages;
+    compiler.osr_target_pc = osr_target_pc;
 
     // Dump JIT code before deinit (pc_map still alive, one-shot)
     if (trace) |tc| {
@@ -4792,7 +4906,7 @@ test "compile and execute constant return" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4824,7 +4938,7 @@ test "compile and execute i32 add" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4861,7 +4975,7 @@ test "compile and execute branch (LE_S + BR_IF_NOT)" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4907,7 +5021,7 @@ test "compile and execute i32 division" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -4954,7 +5068,7 @@ test "compile and execute i32 remainder" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -5022,7 +5136,7 @@ test "compile and execute memory load/store" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -5086,7 +5200,7 @@ test "compile and execute memory store then load" {
         .alloc = alloc,
     };
 
-    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_code = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_code.deinit(alloc);
 
@@ -5142,12 +5256,12 @@ test "const-addr memory load elides bounds check" {
     };
 
     // Compile with min_memory_bytes = 65536 (1 page, all const addrs safe)
-    const jit_opt = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 65536, false) orelse
+    const jit_opt = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 65536, false, null) orelse
         return error.CompilationFailed;
     defer jit_opt.deinit(alloc);
 
     // Compile without optimization (min_memory_bytes = 0)
-    const jit_noopt = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_noopt = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_noopt.deinit(alloc);
 
@@ -5223,11 +5337,11 @@ test "CMP+B.cond fusion saves one instruction per compare-and-branch" {
     var reg_func = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 4, .local_count = 2, .alloc = alloc };
     var reg_func_nofuse = RegFunc{ .code = &code_nofuse, .pool64 = &.{}, .reg_count = 4, .local_count = 2, .alloc = alloc };
 
-    const jit_fused = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_fused = compileFunction(alloc, &reg_func, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_fused.deinit(alloc);
 
-    const jit_nofuse = compileFunction(alloc, &reg_func_nofuse, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_nofuse = compileFunction(alloc, &reg_func_nofuse, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_nofuse.deinit(alloc);
 
@@ -5270,11 +5384,11 @@ test "constant materialization uses MOVN for negative values" {
     var rf_neg = RegFunc{ .code = &code_neg, .pool64 = &.{}, .reg_count = 1, .local_count = 1, .alloc = alloc };
     var rf_pos = RegFunc{ .code = &code_pos, .pool64 = &.{}, .reg_count = 1, .local_count = 1, .alloc = alloc };
 
-    const jit_neg = compileFunction(alloc, &rf_neg, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_neg = compileFunction(alloc, &rf_neg, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_neg.deinit(alloc);
 
-    const jit_pos = compileFunction(alloc, &rf_pos, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit_pos = compileFunction(alloc, &rf_pos, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit_pos.deinit(alloc);
 
@@ -5340,7 +5454,7 @@ test "div-by-constant JIT: unsigned i32.div_u by known 10" {
         .{ .op = regalloc_mod.OP_RETURN, .rd = 2, .rs1 = 0, .operand = 0 },
     };
     var rf = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 3, .local_count = 1, .alloc = alloc };
-    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit.deinit(alloc);
 
@@ -5363,7 +5477,7 @@ test "div-by-constant JIT: power-of-2 divisor uses LSR" {
         .{ .op = regalloc_mod.OP_RETURN, .rd = 2, .rs1 = 0, .operand = 0 },
     };
     var rf = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 3, .local_count = 1, .alloc = alloc };
-    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit.deinit(alloc);
 
@@ -5385,7 +5499,7 @@ test "rem-by-constant JIT: unsigned i32.rem_u by known 10" {
         .{ .op = regalloc_mod.OP_RETURN, .rd = 2, .rs1 = 0, .operand = 0 },
     };
     var rf = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 3, .local_count = 1, .alloc = alloc };
-    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit.deinit(alloc);
 
@@ -5407,7 +5521,7 @@ test "rem-by-constant JIT: power-of-2 divisor uses AND" {
         .{ .op = regalloc_mod.OP_RETURN, .rd = 2, .rs1 = 0, .operand = 0 },
     };
     var rf = RegFunc{ .code = &code, .pool64 = &.{}, .reg_count = 3, .local_count = 1, .alloc = alloc };
-    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false) orelse
+    const jit = compileFunction(alloc, &rf, &.{}, 0, 0, 1, null, 0, false, null) orelse
         return error.CompilationFailed;
     defer jit.deinit(alloc);
 

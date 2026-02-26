@@ -21,6 +21,11 @@
   Ubuntu spec: 62150→62158/62158 (100%).
 - K.x86opt: x86_64 self-call + div-by-constant. Self-call bypasses trampoline,
   div-by-constant uses IMUL+SHR. Ubuntu recursive benchmarks much improved.
+- W34 OSR: ARM64 On-Stack Replacement for C/C++ guard functions. OSR prologue enters
+  JIT at loop body, bypassing init-once guard. Two JIT bugs fixed:
+  (1) FP cache premature-dirty in fpAllocResult (self-clobber when rd==rs1),
+  (2) emitGlobalGet x0 clobber by vreg 20 reload (reg_count > 20).
+  rw_c_matrix 4.5ms, rw_c_math 17.5ms now pass with JIT.
 
 ### Active / TODO
 
@@ -35,7 +40,8 @@
 **Mac ARM64 benchmark status (quick run, vs wasmtime 41.0.1):**
 - Non-blocked gap >1.5x: st_matrix 3.14x (regalloc, 35 vregs), nbody 1.54x
 - Improved to ≤1.5x: tgo_mfr 1.35x (was 1.56x), st_fib2 1.35x (was 1.51x)
-- **Blocked**: rw_c_math 4.42x, rw_c_matrix 1.82x, rw_c_string 1.74x (OSR), gc_tree 3.00x (GC JIT)
+- **Unblocked by OSR**: rw_c_matrix 4.5ms, rw_c_math 17.5ms (now pass with JIT)
+- **Still blocked**: rw_c_string (hangs in interpreter too — separate issue), gc_tree 3.00x (GC JIT)
 
 **Ubuntu x86_64 benchmark status (noisy VM, compare trends not absolutes):**
 - Self-call + div-by-constant ported from ARM64

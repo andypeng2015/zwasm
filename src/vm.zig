@@ -494,7 +494,7 @@ pub const Vm = struct {
                         {
                             wf.call_count += 1;
                             if (wf.call_count >= jit_mod.HOT_THRESHOLD) {
-                                wf.jit_code = jit_mod.compileFunction(self.alloc, reg, wf.ir.?.pool64, wf.func_idx, @intCast(func_ptr.params.len), @intCast(func_ptr.results.len), self.trace, jit_mod.getMinMemoryBytes(inst), jit_mod.getUseGuardPages(inst));
+                                wf.jit_code = jit_mod.compileFunction(self.alloc, reg, wf.ir.?.pool64, wf.func_idx, @intCast(func_ptr.params.len), @intCast(func_ptr.results.len), self.trace, jit_mod.getMinMemoryBytes(inst), jit_mod.getUseGuardPages(inst), null);
                                 if (wf.jit_code == null) {
                                     wf.jit_failed = true;
                                     if (self.trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "compilation failed");
@@ -521,7 +521,13 @@ pub const Vm = struct {
                         if (err == error.JitRestart) {
                             if (wf.jit_code) |jc| {
                                 if (self.trace) |tc| trace_mod.traceJitRestart(tc, wf.func_idx);
-                                try self.executeJIT(jc, reg, inst, func_ptr, args, results);
+                                // OSR: use osr_entry (enters at loop body, bypassing init)
+                                // Normal: use entry (starts at pc=0)
+                                if (jc.osr_entry) |osr| {
+                                    try self.executeJITOsr(jc, osr, reg, inst, results);
+                                } else {
+                                    try self.executeJIT(jc, reg, inst, func_ptr, args, results);
+                                }
                                 return;
                             }
                         }
@@ -3401,6 +3407,62 @@ pub const Vm = struct {
     // JIT execution (D105)
     // ================================================================
 
+    /// OSR (On-Stack Replacement) JIT execution: enters JIT code at a loop body,
+    /// reusing the interpreter's current register file. Used for back-edge JIT of
+    /// functions with reentry guards where normal JitRestart (from pc=0) would fail.
+    fn executeJITOsr(
+        self: *Vm,
+        jc: *jit_mod.JitCode,
+        osr_fn: jit_mod.JitFn,
+        reg: *regalloc_mod.RegFunc,
+        instance: *Instance,
+        results: []u64,
+    ) WasmError!void {
+        // The interpreter's register file is in reg_stack at self.reg_ptr.
+        // executeRegIR's defer restored reg_ptr to frame base, but register
+        // values are still intact. Expand frame for JIT overhead (+4 slots).
+        const base = self.reg_ptr;
+        const needed: usize = reg.reg_count + 4;
+        if (base + needed > REG_STACK_SIZE) return error.Trap;
+        self.reg_ptr = base + needed;
+        defer self.reg_ptr = base;
+
+        const regs_ptr = self.reg_stack[base..].ptr;
+
+        // Set guard page recovery point
+        if (jc.oob_exit_offset != 0) {
+            const buf_start = @intFromPtr(jc.buf.ptr);
+            guard_mod.setRecovery(.{
+                .oob_exit_pc = buf_start + jc.oob_exit_offset,
+                .jit_code_start = buf_start,
+                .jit_code_end = buf_start + jc.code_len,
+                .active = true,
+            });
+        }
+
+        // Call OSR entry: sets up callee-saved, memory cache, then jumps to loop body
+        const err_code = osr_fn(regs_ptr, @ptrCast(self), @ptrCast(instance));
+
+        guard_mod.clearRecovery();
+
+        if (err_code != 0) {
+            return switch (err_code) {
+                1 => error.Trap,
+                2 => error.StackOverflow,
+                3 => error.DivisionByZero,
+                4 => error.IntegerOverflow,
+                5 => error.Unreachable,
+                6 => error.OutOfBoundsMemoryAccess,
+                7 => error.WasmException,
+                8 => error.InvalidConversion,
+                else => error.Trap,
+            };
+        }
+
+        // Result is in regs[0]
+        if (results.len > 0) results[0] = self.reg_stack[base];
+    }
+
     fn executeJIT(
         self: *Vm,
         jc: *jit_mod.JitCode,
@@ -3476,18 +3538,15 @@ pub const Vm = struct {
         trace: ?*trace_mod.TraceConfig,
         min_memory_bytes: u32,
         use_guard_pages: bool,
+        back_edge_target: u32,
     ) WasmError!void {
         count.* += 1;
         if (count.* == jit_mod.BACK_EDGE_THRESHOLD) {
-            // W34: functions with reentry guards (C/C++ init patterns) cannot use
-            // JitRestart — re-execution from pc=0 triggers the guard trap.
-            // Requires OSR (on-stack replacement) to optimize these functions.
-            if (hasReentryGuard(reg.code)) {
-                wf.jit_failed = true;
-                if (trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "W34: reentry guard (needs OSR)");
-                return;
-            }
-            wf.jit_code = jit_mod.compileFunction(alloc, reg, pool64, wf.func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages);
+            // For functions with reentry guards (C/C++ init patterns): compile with
+            // OSR entry that jumps directly to the loop body, bypassing init section.
+            const has_guard = hasReentryGuard(reg.code);
+            const osr_pc: ?u32 = if (has_guard) back_edge_target else null;
+            wf.jit_code = jit_mod.compileFunction(alloc, reg, pool64, wf.func_idx, param_count, result_count, trace, min_memory_bytes, use_guard_pages, osr_pc);
             if (wf.jit_code != null) {
                 if (trace) |tc| trace_mod.traceJitBackEdge(tc, wf.func_idx, @intCast(reg.code.len), @intCast(wf.jit_code.?.buf.len));
                 return error.JitRestart;
@@ -3576,14 +3635,14 @@ pub const Vm = struct {
                 // ---- Control flow ----
                 regalloc_mod.OP_BR => {
                     if (jit_eligible and instr.operand < pc)
-                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                     pc = instr.operand;
                 },
 
                 regalloc_mod.OP_BR_IF => {
                     if (regs[instr.rd] != 0) {
                         if (jit_eligible and instr.operand < pc)
-                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                         pc = instr.operand;
                     }
                 },
@@ -3591,7 +3650,7 @@ pub const Vm = struct {
                 regalloc_mod.OP_BR_IF_NOT => {
                     if (regs[instr.rd] == 0) {
                         if (jit_eligible and instr.operand < pc)
-                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                            try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, instr.operand);
                         pc = instr.operand;
                     }
                 },
@@ -4149,7 +4208,7 @@ pub const Vm = struct {
                     const target_entry = if (idx < count) idx else count; // default is last
                     const target_pc = code[pc + target_entry].operand;
                     if (jit_eligible and target_pc < pc)
-                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages);
+                        try checkBackEdgeJit(&back_edge_count, wf.?, self.alloc, reg, pool64, jit_param_count, jit_result_count, self.trace, jit_min_mem_bytes, jit_use_guard_pages, target_pc);
                     pc = target_pc;
                     continue;
                 },
@@ -5023,7 +5082,7 @@ pub const Vm = struct {
                                 wf.call_count += 1;
                                 if (wf.call_count >= jit_mod.HOT_THRESHOLD) {
                                     const jit_inst: *Instance = @ptrCast(@alignCast(wf.instance));
-                                    wf.jit_code = jit_mod.compileFunction(self.alloc, reg, wf.ir.?.pool64, wf.func_idx, @intCast(current_fp.params.len), @intCast(current_fp.results.len), self.trace, jit_mod.getMinMemoryBytes(jit_inst), jit_mod.getUseGuardPages(jit_inst));
+                                    wf.jit_code = jit_mod.compileFunction(self.alloc, reg, wf.ir.?.pool64, wf.func_idx, @intCast(current_fp.params.len), @intCast(current_fp.results.len), self.trace, jit_mod.getMinMemoryBytes(jit_inst), jit_mod.getUseGuardPages(jit_inst), null);
                                     if (wf.jit_code == null) {
                                         wf.jit_failed = true;
                                         if (self.trace) |tc| trace_mod.traceJitBail(tc, wf.func_idx, "compilation failed");
