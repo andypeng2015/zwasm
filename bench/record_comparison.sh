@@ -25,8 +25,9 @@ cd "$PROJECT_ROOT"
 
 RUNTIMES="zwasm,wasmtime,bun,node"
 BENCH_FILTER=""
-RUNS=3
-WARMUP=1
+RUNS=5
+WARMUP=3
+TIMEOUT=60  # per-runtime timeout in seconds
 
 for arg in "$@"; do
   case "$arg" in
@@ -245,9 +246,9 @@ for entry in "${BENCHMARKS[@]}"; do
     cmd=$(build_cmd "$rt" "$wasm" "$func" "$bench_args" "$kind")
     json_file="$TMPDIR_BENCH/${name}_${rt}.json"
 
-    # Speed: hyperfine (skip runtime if it fails)
-    if ! hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$json_file" "$cmd" >/dev/null 2>&1; then
-      printf "  %-10s   FAILED\n" "$rt"
+    # Speed: hyperfine with timeout (skip runtime if it fails or times out)
+    if ! timeout "${TIMEOUT}s" hyperfine --warmup "$WARMUP" --runs "$RUNS" --export-json "$json_file" "$cmd" >/dev/null 2>&1; then
+      printf "  %-10s   FAILED/TIMEOUT\n" "$rt"
       continue
     fi
     time_ms=$(python3 -c "

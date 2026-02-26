@@ -5,72 +5,62 @@
 ## Branch
 `strictly-check/reliability-003` (from main at d55a72b)
 
-## Progress
+## Current: Plan A (段階的リグレッション修正 + 機能実装)
 
-### ✅ Completed
-- A-F: Environment, compilation, compat, E2E expansion, benchmarks, analysis, W34 fix
-- G.1-G.3: Ubuntu spec 62,158/62,158 (100%). Real-world: all pass without JIT, 6/9 fail with JIT → Phase J
-- I.0-I.7: E2E 792/792 (100%). FP precision fix (JIT getOrLoad dirty FP cache),
-  funcref validation, import type checking, memory64 bulk ops,
-  GC array alloc guard, externref encoding, thread/wait sequential simulation.
-- J.1-J.3: x86_64 JIT bug fixes complete. All C/C++ real-world pass with JIT.
-  Fixes: division safety (SIGFPE), ABI register clobbering (global.set, mem ops),
-  SCRATCH2/vreg10 alias (R11 reserved), call liveness (rd as USE for return/store).
-- K.x86: x86_64 JIT trunc_sat fix. Indefinite value detection for i32 case,
-  subtract-2^63-and-add-back for i64 unsigned. Interpreter: floatToIntBits (IEEE 754).
-  Ubuntu spec: 62150→62158/62158 (100%).
-- K.x86opt: x86_64 self-call + div-by-constant. Self-call bypasses trampoline,
-  div-by-constant uses IMUL+SHR. Ubuntu recursive benchmarks much improved.
-- W34 OSR: ARM64 On-Stack Replacement for C/C++ guard functions. OSR prologue enters
-  JIT at loop body, bypassing init-once guard. Two JIT bugs fixed:
-  (1) FP cache premature-dirty in fpAllocResult (self-clobber when rd==rs1),
-  (2) emitGlobalGet x0 clobber by vreg 20 reload (reg_count > 20).
-  rw_c_matrix 4.5ms, rw_c_math 17.5ms now pass with JIT.
+### Active Phase
+**Phase 1: rw_c_string hang 修正** (Priority A)
 
-### Active / TODO
+### Phase Checklist
+- [ ] **P1**: rw_c_string hang 修正 — OSR 誤爆調査
+- [ ] **P2**: nbody FP キャッシュ修正 — be466a0 のリグレッション解消 (43ms→≤15ms)
+- [ ] **P3**: rw_c_math 再計測 — P2 の波及効果確認、追加最適化判断
+- [ ] **P4**: GC JIT 基本実装 — struct/array ops を JIT 化
+- [ ] **P5**: st_matrix 許容判断 — 3.5x 以内で例外扱い
 
-**Phase K: Performance optimization (target: all ≤1.5x wasmtime)**
-- [x] K.2: JIT opcode coverage — select, br_table, trunc_sat, div-by-constant (UMULL+LSR)
-- [x] K.3: FP optimization — FP-direct load/store, const-folded ADD/SUB (marginal on ARM64)
-- [x] K.4: Self-call setup optimization — bypass shared prologue, skip reg_ptr memory sync
-- [x] K.5: Benchmark re-recording on BOTH platforms
-- [x] K.6: x86_64 self-call optimization (inline CALL to lightweight entry point)
-- [x] K.7: x86_64 div-by-constant (IMUL r64 + SHR r64 for multiply-by-reciprocal)
+### Per-Phase Workflow (重要)
+```
+1. 調査: 原因特定、wasmtime 参照
+2. 実装: TDD (Red→Green→Refactor)
+3. 検証: zig build test + spec tests (該当時)
+4. ベンチ: bash bench/run_bench.sh --quick (リグレッション確認)
+5. 記録: bash bench/record.sh --id=P{N} --reason="..."  ← 必須！
+6. コミット
+7. 次の Phase へ
+```
 
-**Mac ARM64 benchmark status (quick run, vs wasmtime 41.0.1):**
-- Non-blocked gap >1.5x: st_matrix 3.14x (regalloc, 35 vregs), nbody 1.54x
-- Improved to ≤1.5x: tgo_mfr 1.35x (was 1.56x), st_fib2 1.35x (was 1.51x)
-- **Unblocked by OSR**: rw_c_matrix 4.5ms, rw_c_math 17.5ms (now pass with JIT)
-- **Still blocked**: rw_c_string (hangs in interpreter too — separate issue), gc_tree 3.00x (GC JIT)
+## Latest Benchmark Snapshot (a26a178, runs=5/warmup=3)
 
-**Ubuntu x86_64 benchmark status (noisy VM, compare trends not absolutes):**
-- Self-call + div-by-constant ported from ARM64
-- Recursive benchmarks improved: fib ~1x, tak ~1.2-1.5x, tgo_fib ~1x, st_fib2 ~2.6x
-- Still slower on some: tgo_nqueens ~1.5-1.7x, tgo_mfr ~3x (regalloc), rw_c_* (OSR)
+### >1.5x wasmtime (要対応)
+| bench | zwasm | wasmtime | ratio | Phase |
+|-------|------:|--------:|------:|-------|
+| nbody | 43.8 | 22.0 | 1.99x | P2 |
+| rw_c_math | 16.4 | 8.8 | 1.86x | P3 |
+| gc_alloc | 19.2 | 10.7 | 1.79x | P4 |
+| gc_tree | 138.1 | 31.4 | 4.40x | P4 |
+| st_matrix | 296.3 | 91.7 | 3.23x | P5 (例外) |
+| rw_c_string | ∞ | 9.3 | hang | P1 |
 
-**Phase H: Documentation (LAST — requires Phase H Gate pass, see plan)**
-- [ ] H.0: Phase H Gate — conditions 1-5,8 met. Conditions 6-7 (benchmarks ≤1.5x) blocked by:
-  - Mac: st_matrix (regalloc), rw_c_* (OSR), gc_tree (GC JIT)
-  - Ubuntu: some benchmarks still >1.5x (noisy measurements, needs quiet re-run)
-- [ ] H.1: Audit README claims
-- [ ] H.2: Fix discrepancies
-- [ ] H.3: Update benchmark table
+### ≤1.5x wasmtime (OK — 21個)
+fib 0.88x, tak 0.86x, sieve 0.51x, nqueens 0.65x, tgo_tak 0.62x,
+tgo_arith 0.40x, tgo_sieve 0.61x, tgo_fib_loop 0.51x, tgo_gcd 0.38x,
+tgo_list 0.53x, tgo_strops 0.95x, st_sieve 0.94x, st_nestedloop 0.56x,
+st_ackermann 0.48x, rw_c_matrix 0.82x, rw_cpp_string 0.49x, rw_cpp_sort 0.53x,
+tgo_rwork 1.03x, tgo_fib 1.18x, tgo_nqueens 1.19x, st_fib2 1.35x, tgo_mfr 1.42x,
+rw_rust_fib 1.22x
 
-## Next session: start here
+## Completed (reliability-003)
+- A-F: Environment, compilation, compat, E2E, benchmarks, analysis
+- G: Ubuntu spec 62,158/62,158 (100%)
+- I.0-I.7: E2E 792/792 (100%), FP precision fix
+- J.1-J.3: x86_64 JIT bug fixes (division, ABI, SCRATCH2, liveness)
+- K.old: select/br_table/trunc_sat JIT, self-call opt, div-const, FP-direct, OSR
+- Bench infra: record.sh upgraded (29 benchmarks, runs=5/warmup=3, timeout)
+- history.yaml: per-commit rerun data (28 commits b39b828..ee5f585)
 
-1. **Phase H Gate blockers**: st_matrix (regalloc), OSR for rw_c_*, GC JIT for gc_tree.
-2. After gates pass: Phase H (documentation audit).
+## Uncommitted
+- `src/jit.zig`: experimental FP immediate-offset optimization (ldrFp64Imm/strFp64Imm)
+  → P2 で判断。効果薄ければ revert。
 
-## x86_64 JIT status (Phase K complete)
-All C/C++ real-world programs pass with JIT on Ubuntu x86_64.
-Self-call optimization and div-by-constant ported from ARM64.
-Key self-call bugs fixed:
-- RAX clobber: save error code to RCX during call_depth/reg_ptr cleanup
-- R12 restore: SUB R12, needed_bytes after callee returns
-- Result propagation: copy callee regs[0] to caller's rd slot
-- emitArgCopyDirect: always load from memory (not stale physical regs)
-
-## Benchmark gaps (Phase K status)
-**Improved**: fib ~1x (was 3x), tak ~1.2x (was 3.3x), tgo_fib ~1x (was 3.2x).
-**Blocked (needs OSR/GC JIT)**: rw_c_math, rw_c_matrix, rw_c_string, gc_tree.
-**Needs arch changes**: st_matrix 3.1x (regalloc), tgo_mfr ~3x (regalloc).
+## Known Bugs
+- c_hello_wasi: EXIT=71 on Ubuntu (WASI issue, not JIT)
+- Go WASI: 3 Go programs produce no output (WASI compatibility)

@@ -15,26 +15,24 @@ Session handover document. Read at session start.
 Reliability improvement (branch: `strictly-check/reliability-003`).
 Plan: `@./.dev/reliability-plan.md`. Progress: `@./.dev/reliability-handover.md`.
 
-Phases A-K complete. E2E 792/792 (100%), x86_64 JIT fully optimized.
-**W34 OSR + JIT fixes**: ARM64 OSR (On-Stack Replacement) implemented for
-back-edge JIT of C/C++ functions with init-once guard patterns.
-Two critical bugs fixed:
-1. FP cache premature-dirty: `fpAllocResult` set dirty before actual D-reg write,
-   causing self-clobbering when rd==rs1 in `emitFpMemLoad64`.
-2. `emitGlobalGet` x0 clobber: `reloadCallerSaved()` overwrote x0 (return value)
-   with vreg 20 when reg_count > 20. Fixed by storing result before reload.
-rw_c_matrix (4.5ms), rw_c_math (17.5ms) now pass with JIT.
-**Phase H Gate**: conditions 1-5,8 met. Remaining blockers:
-Mac: st_matrix 3.14x (regalloc), gc_tree (GC JIT), nbody 1.54x, rw_c_string (hangs in interpreter too).
-Next: Phase H Gate remaining blockers, then Phase H (documentation audit).
+**Plan A: 段階的リグレッション修正 + 機能実装**
+- P1: rw_c_string hang 修正 (Priority A — 正確性)
+- P2: nbody FP キャッシュ修正 (Priority C — リグレッション)
+- P3: rw_c_math 再計測 (Priority C)
+- P4: GC JIT 基本実装 (Priority B)
+- P5: st_matrix 許容判断 (Priority C)
+
+**Active: P1 (rw_c_string hang)**
+OSR (ee5f585) で発生。22859e2 時点では 21ms で正常。
+back-edge 検出 or guard 判定の誤爆を調査。
 
 ## Previous Task
 
-W34 OSR + JIT bug fixes:
-- ARM64 OSR prologue: callee-saved push, REGS_PTR setup, mem cache, vreg load, branch to target
-- FP cache fix: `fpAllocResult` no longer premature-dirty; callers call `fpMarkResultDirty` after write
-- GlobalGet fix: store x0 to regs[rd] before `reloadCallerSaved()` to prevent vreg 20 clobber
-- x86_64 OSR: infrastructure fields added (guard_branch_pc, osr_target_pc, osr_prologue_offset)
+reliability-003 Phases A-K + OSR + bench infra upgrade:
+- E2E 792/792, spec 62,158, x86 JIT fixes, self-call/div-const opt
+- Bench recording upgraded: 29 benchmarks, runs=5/warmup=3, timeout
+- history.yaml: per-commit rerun (28 commits)
+- **発見**: be466a0 で nbody 4x リグレッション (FP cache precision fix)
 
 ## Known Bugs
 

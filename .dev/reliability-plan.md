@@ -7,120 +7,101 @@
 ## Goal
 
 Make zwasm **undeniably correct and fast** on Mac (aarch64) and Ubuntu (x86_64).
-Zero "known limitations". All tests 100%. All benchmarks ≤1.5x wasmtime.
+zwasm の理念: **仕様100%準拠、wasmtimeで動くものは全部動く、軽量なのにwasmtimeに匹敵する速さ。**
 
-## Phases
+## Priority Order
 
-| # | Phase | Status |
-|---|-------|--------|
-| A-F | Environment, compilation, compat, E2E, benchmarks, analysis | ✅ complete |
-| G | Ubuntu cross-platform verification | ✅ spec/unit pass, JIT bugs found → J |
-| **I** | **E2E 100% + FP correctness** | active |
-| **J** | **x86_64 JIT bug fixes** | active |
-| **K** | **Performance deep optimization** | next |
-| H | Documentation accuracy audit | LAST (after I, J, K) |
+| Priority | 意味 | 基準 |
+|----------|------|------|
+| **A** | 正確性 | spec/test/real-world が arm64+amd64 で完全動作 |
+| **B** | 機能充足 | 未実装機能を実装（GC JIT等） |
+| **C** | 性能 | wasmtime 1x目標、1.5x許容、例外的に2-3x許容（single-pass限界） |
 
-Execution: I + J (parallel) → K → H.
+## Completed Phases
 
----
+| Phase | 内容 | Status |
+|-------|------|--------|
+| A-F | 環境/コンパイル/compat/E2E/ベンチ/解析 | ✅ |
+| G | Ubuntu cross-platform | ✅ spec 62,158 (100%) |
+| I | E2E 100% + FP correctness | ✅ 792/792 |
+| J | x86_64 JIT bug fixes | ✅ |
+| K.old | JIT opcode coverage, self-call, div-const | ✅ |
 
-## Phase I: E2E 100% + FP Correctness
+## Active: Plan A — 段階的リグレッション修正 + 機能実装
 
-Target: 778/778 (100%) E2E + 13/13 (100%) real-world compat.
+### Phase 1: rw_c_string hang 修正 (Priority A — 正確性)
 
-**For every sub-task**: read failing test → check wasmtime source → WebSearch spec → implement → test → no regressions.
+**症状**: zwasm で rw_c_string がタイムアウト（60s）。wasmtime は 9.3ms。
+**原因**: ee5f585 (OSR) で発生。22859e2 時点では 21ms で正常動作。
+**方針**: OSR の back-edge 検出 or guard 関数判定の誤爆を調査。
 
-### I.0: FP precision root cause fix
-c_math_compute: zwasm 21304744.877962 vs wasmtime 21304744.878669.
-Same wasm bytecode → IEEE 754 mandates identical results → zwasm has FP bug.
-**Approach**: Binary search subsets of computation to isolate diverging f64 operation.
-Check `wasmNearest()`, JIT FP codegen (x87 vs SSE, NEON rounding).
+検証:
+- `./zig-out/bin/zwasm run test/realworld/wasm/c_string_processing.wasm` が正常完了すること
+- `zig build test` pass, spec pass, 他ベンチにリグレッションなし
+- **record**: `bash bench/record.sh --id=P1 --reason="Fix rw_c_string hang"`
 
-### I.1: Typed funcref validation (30 assert_invalid)
-Implement type validation in validator for call_indirect with typed function references.
-**Ref**: wasmtime `cranelift/wasm/src/code_translator.rs`.
+### Phase 2: nbody FP キャッシュ修正 (Priority C — リグレッション)
 
-### I.2: Import type checking (7 assert_unlinkable)
-Implement import type compatibility validation during instantiation.
-**Ref**: wasmtime `crates/wasmtime/src/runtime/instantiate.rs`.
+**症状**: nbody 43.8ms (1.99x wasmtime)。be466a0 以前は 8-12ms (0.5x)。
+**原因**: be466a0 "Fix JIT FP precision: getOrLoad must check dirty FP cache first"
+  → 正確性修正は正しいが、実装が過剰にFPキャッシュを evict している。
+**方針**: `rd==rs1` のときだけ退避する限定的修正に書き換え。正確性維持。
+**目標**: 10-15ms (≤0.7x wasmtime) に戻す。
 
-### I.3: Memory64 bounds edge cases (9 failures)
-Zero-length ops at OOB addresses should trap. Fix bounds checking.
+検証:
+- nbody ≤ 15ms、spec pass、他ベンチにリグレッションなし
+- **record**: `bash bench/record.sh --id=P2 --reason="Fix nbody FP cache regression"`
 
-### I.4: GC ref.test type combinations (2 failures)
-### I.5: GC array-alloc-too-large (2 failures)
-### I.6: Memory64 linking validation (3 failures)
-### I.7: Threads SB_atomic ordering (1 failure)
-Try multiple approaches: compiler fences, atomic ordering, memory barriers.
+### Phase 3: rw_c_math 再計測 (Priority C)
 
----
+**症状**: 16.4ms (1.86x wasmtime 8.8ms)。FP heavy。
+**方針**: Phase 2 の nbody FP修正が波及して改善する可能性あり。まず再計測。
+  改善不十分なら追加の FP キャッシュ最適化を検討。
 
-## Phase J: x86_64 JIT Bug Fixes
+検証:
+- **record**: `bash bench/record.sh --id=P3 --reason="Re-measure after FP cache fix"`
 
-All real-world programs PASS with JIT disabled. x86_64 JIT-specific bugs:
-- cpp_string_ops: Arithmetic exception (signal 6)
-- c_string_processing, cpp_vector_sort: OOB memory access
-- go_hello_wasi, go_json_marshal, go_sort_benchmark: OOB memory access
+### Phase 4: GC JIT 基本実装 (Priority B — 機能実装)
 
-**Investigation** (do while Ubuntu SSH runs in background):
-1. Read `src/x86.zig` — compare with `src/jit.zig` (aarch64)
-2. `--dump-jit=N` to diff aarch64 vs x86_64 codegen
-3. Study cranelift x86_64: `~/Documents/OSS/wasmtime/cranelift/codegen/src/isa/x64/`
-4. WebSearch for x86_64 calling convention edge cases
-5. Look for: register clobbering, stack alignment, addressing mode overflow, sign extension
+**症状**: gc_alloc 1.79x, gc_tree 4.40x。GC opcodes がインタプリタ fallback。
+**方針**: struct.new, struct.get, struct.set, array.new, array.get, array.set を JIT 化。
+  GC 方式（回収ロジック）は JIT codegen に影響しない——struct/array のメモリレイアウトに
+  対する load/store を生成するだけ。
+**目標**: gc_alloc ≤1.5x, gc_tree ≤2x。
 
-Fix root cause → verify all real-world programs pass on Ubuntu with JIT.
+検証:
+- GC spec tests pass, unit tests pass
+- **record**: `bash bench/record.sh --id=P4 --reason="GC JIT basic opcodes"`
 
----
+### Phase 5: st_matrix — 許容判断 (Priority C — single-pass 限界)
 
-## Phase K: Performance Deep Optimization
-
-Target: all benchmarks ≤1.5x wasmtime (1.0x ideal). No ROI-based deferral.
-
-**Methodology per benchmark**: profile → read cranelift codegen → list 2-3 approaches →
-try each (implement, measure, keep or revert) → record in runtime_comparison.yaml.
-
-### K.1: JIT call threshold tuning
-Try: lower threshold (50→20), selective lowering for JIT callees.
-
-### K.2: Library function JIT coverage (biggest gap: 4-6x)
-Root cause: libm/libc inner loops stay on interpreter.
-**Try in order**: (1) lower call-count threshold, (2) interprocedural hotness propagation,
-(3) eager JIT for large modules, (4) profile-guided second-pass JIT.
-
-### K.3: Register allocation for f64-heavy code (st_matrix 2.8x, rw_c_matrix 2.7x)
-Study cranelift regalloc. Try: spill/reload heuristics, register coalescing for FP loads.
-
-### K.4: GC allocation optimization (gc_tree 3.2x)
-Profile heap ops. Try: inline bump allocator fast path. Compare wasmtime GC impl.
-
-### K.5: Benchmark re-recording
-After each optimization: re-run ALL benchmarks on BOTH platforms. No cross-regression.
+**症状**: 296ms (3.23x wasmtime 92ms)。35 vreg、single-pass regalloc の本質的限界。
+  cranelift は graph-coloring regalloc で最適 spill 位置を決定できる。
+**判断**: 3.5x 以内を許容。改善余地があれば LRU eviction 等を試すが、
+  1.5x 達成は現実的でない。
+**公式例外**: Phase H Gate 条件 6 で st_matrix を例外扱い。
 
 ---
 
 ## Phase H Gate — Entry Criteria
 
 **Phase H may NOT begin until ALL of the following are satisfied.**
-Every item requires a root-cause fix — no workarounds, no "close enough", no
-ROI-based deferral. If a condition fails, go back and fix the underlying issue.
 
 | # | Condition | Verification |
 |---|-----------|-------------|
-| 1 | E2E: **778/778 (100%)** | Mac: e2e runner reports 0 failures |
-| 2 | Real-world Mac: **13/13 PASS** (FP diff = 0) | `bash test/realworld/run_compat.sh` exits 0 |
-| 3 | Real-world Ubuntu: **all PASS with JIT enabled** | `ssh ubuntu ... run_compat.sh` exits 0 |
-| 4 | Spec Mac: **62,158/62,158 (100%)** | `python3 test/spec/run_spec.py --build --summary` |
-| 5 | Spec Ubuntu: **62,158/62,158 (100%)** | SSH same as above |
-| 6 | Benchmarks Mac: **all ≤1.5x wasmtime** | `bash bench/compare_runtimes.sh` (5 runs / 3 warmup) |
-| 7 | Benchmarks Ubuntu: **all ≤1.5x wasmtime** | SSH same as above |
-| 8 | Unit tests: **Mac + Ubuntu PASS** | `zig build test` on both |
-| 9 | Benchmark regression: **none** | `bash bench/run_bench.sh` (5 runs / 3 warmup, no `--quick`) |
-
-**If any condition is not met, do not proceed to Phase H. Fix the root cause first.**
+| 1 | E2E: **778/778 (100%)** | Mac: e2e runner 0 failures |
+| 2 | Real-world Mac: **all PASS** | `bash test/realworld/run_compat.sh` exits 0 |
+| 3 | Real-world Ubuntu: **all PASS with JIT** | SSH same |
+| 4 | Spec Mac: **62,158/62,158** | `python3 test/spec/run_spec.py --build --summary` |
+| 5 | Spec Ubuntu: **62,158/62,158** | SSH same |
+| 6 | Benchmarks Mac: **≤1.5x wasmtime** | `bash bench/compare_runtimes.sh` |
+|   | 例外: st_matrix ≤3.5x (single-pass regalloc 限界) | |
+| 7 | Benchmarks Ubuntu: **≤1.5x wasmtime** (同例外) | SSH same |
+| 8 | Unit tests: **Mac + Ubuntu PASS** | `zig build test` |
+| 9 | Benchmark regression: **none vs history.yaml** | `bash bench/run_bench.sh` |
 
 ---
 
 ## Phase H: Documentation Accuracy (LAST)
 
-Only begins after Phase H Gate passes. Audit README claims, fix discrepancies, update benchmark table.
+Phase H Gate 通過後。README claims audit, benchmark table update.

@@ -47,8 +47,7 @@ for arg in "$@"; do
       echo "                      st_ackermann, st_matrix"
       echo "  Layer 4 (GC):      gc_alloc, gc_tree"
       echo "  Layer 5 (Real):    rw_rust_fib, rw_c_matrix, rw_c_math,"
-      echo "                     rw_c_string, rw_cpp_string, rw_cpp_sort,"
-      echo "                     rw_go_sort, rw_go_json"
+      echo "                     rw_c_string, rw_cpp_string, rw_cpp_sort"
       exit 0
       ;;
   esac
