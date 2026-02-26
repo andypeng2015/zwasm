@@ -3,31 +3,66 @@
 > Plan: `@./.dev/reliability-plan.md`. Rules: `@./.claude/rules/reliability-work.md`.
 
 ## Branch
-`strictly-check/reliability-004` (from main at 74153ff, after P1+P2 merge)
+`strictly-check/reliability-005` (from main at f654cc9, after reliability-004 merge)
 
-P1+P2 merged to main. Remaining: P3-P5.
+## Current: reliability-005 — Real-world DIFF fix + test expansion + Phase H
 
-## Current: Plan A — Incremental regression fix + feature implementation
+### Goal
+1. Fix all real-world DIFF (0 failures on Mac + Ubuntu)
+2. Expand real-world tests from 12 → 30 (minimal feature overlap)
+3. E2E segfault fix (Mac aarch64)
+4. Phase H Gate pass → merge to main → CI green → Phase H (41-file doc audit)
 
 ### Active Phase
-**All phases complete.** Ready for merge gate.
+**R1: E2E segfault investigation + fix**
 
 ### Phase Checklist
-- [x] **P1**: rw_c_string hang fix — skip back-edge JIT for reentry guard functions (20.2ms, was timeout)
-- [x] **P2**: nbody FP cache fix — expand D-reg cache D2-D15 + FP-aware MOV (23.1ms, 0.97x wasmtime)
-- [x] **P3**: rw_c_math — accepted as regalloc limit (58ms, 4.92x, 136 regs / 1381 IR instrs)
-- [x] **P4**: GC JIT basic implementation — predecode+regalloc+JIT for struct ops (gc_alloc 0.50x, gc_tree 0.73x wasmtime)
-- [x] **P5**: st_matrix — accepted as regalloc limit exception (296ms, 3.23x wasmtime, 35 vregs)
 
-### Per-Phase Workflow (important)
+#### Infrastructure
+- [x] **R0**: CI + gate update — add E2E/compat to gates, memory check, WASI SDK/wasmtime in CI
+
+#### E2E + DIFF fixes
+- [ ] **R1**: E2E segfault fix — Mac aarch64 e2e_runner crashes (0xaaaaaaaaaaaaaab2 poison)
+- [ ] **R2**: Go WASI fix — 3 Go programs produce no output (go_hello_wasi, go_json_marshal, go_sort_benchmark)
+- [ ] **R3**: cpp_string_ops Ubuntu fix — 25000 vs 24995 (x86_64 only)
+- [ ] **R4**: c_hello_wasi Ubuntu fix — EXIT=71 (WASI issue)
+
+#### Test expansion (12 → 30)
+- [ ] **R5**: Add 18 new real-world test programs across C/C++/Go/Rust
+  - Minimize feature overlap with existing 12
+  - Cover: integer math, FP math, string/array ops, recursion, I/O, env vars,
+    CLI args, data structures, bitwise ops, memory alloc, control flow, etc.
+  - All must PASS on Mac + Ubuntu (DIFF = 0)
+
+#### Merge + Phase H
+- [ ] **R6**: Phase H Gate — all 9 conditions pass (Mac + Ubuntu)
+- [ ] **R7**: Merge to main, push, CI green
+- [ ] **R8**: Phase H — 41-file comprehensive documentation audit
+
+### Existing Real-World Tests (12)
+| # | Program | Language | WASI Features |
+|---|---------|----------|---------------|
+| 1 | c_hello_wasi | C | stdout, argv |
+| 2 | c_math_compute | C | stdout, math (sin/cos/sqrt) |
+| 3 | c_matrix_multiply | C | stdout, loops, arrays |
+| 4 | c_string_processing | C | stdout, string ops |
+| 5 | cpp_string_ops | C++ | stdout, std::string |
+| 6 | cpp_vector_sort | C++ | stdout, std::vector, std::sort |
+| 7 | go_hello_wasi | Go | stdout, argv (DIFF) |
+| 8 | go_json_marshal | Go | stdout, encoding/json (DIFF) |
+| 9 | go_sort_benchmark | Go | stdout, sort (DIFF) |
+| 10 | rust_fib_compute | Rust | stdout, recursion |
+| 11 | rust_file_io | Rust | stdout, file I/O (/tmp) |
+| 12 | rust_hello_wasi | Rust | stdout, env vars |
+
+### Per-Phase Workflow
 ```
 1. Investigate: identify root cause, check wasmtime reference
 2. Implement: TDD (Red → Green → Refactor)
 3. Verify: zig build test + spec tests (when applicable)
-4. Bench: bash bench/run_bench.sh --quick (regression check)
-5. Record: bash bench/record.sh --id=P{N} --reason="..."  ← MANDATORY
-6. Commit
-7. Proceed to next phase
+4. Compat: bash test/realworld/run_compat.sh (all PASS)
+5. Commit
+6. Proceed to next phase
 ```
 
 ## Latest Benchmark Snapshot (P4, runs=5/warmup=3)
@@ -47,18 +82,27 @@ rw_cpp_sort 0.53x, tgo_rwork 1.03x, tgo_fib 1.18x, tgo_nqueens 1.19x,
 st_fib2 1.35x, tgo_mfr 1.42x, rw_rust_fib 1.22x,
 gc_alloc 0.50x, gc_tree 0.73x
 
-## Completed (reliability-003)
+## Completed
+
+### reliability-004 (P1-P5)
+- [x] P1: rw_c_string hang fix — skip back-edge JIT for reentry guard (20.2ms)
+- [x] P2: nbody FP cache fix — expand D-reg cache D2-D15, FP-aware MOV (0.97x wasmtime)
+- [x] P3: rw_c_math — accepted as regalloc limit (4.92x)
+- [x] P4: GC JIT — struct ops (gc_alloc 0.50x, gc_tree 0.73x wasmtime)
+- [x] P5: st_matrix — accepted as regalloc limit (3.23x)
+
+### reliability-003 (A-K)
 - A-F: Environment, compilation, compat, E2E, benchmarks, analysis
 - G: Ubuntu spec 62,158/62,158 (100%)
 - I.0-I.7: E2E 792/792 (100%), FP precision fix
 - J.1-J.3: x86_64 JIT bug fixes (division, ABI, SCRATCH2, liveness)
 - K.old: select/br_table/trunc_sat JIT, self-call opt, div-const, FP-direct, OSR
-- Bench infra: record.sh upgraded (29 benchmarks, runs=5/warmup=3, timeout)
-- history.yaml: per-commit rerun data (28 commits b39b828..ee5f585)
 
 ## Uncommitted
 None.
 
 ## Known Bugs
-- c_hello_wasi: EXIT=71 on Ubuntu (WASI issue, not JIT — same with --profile)
-- Go WASI: 3 Go programs produce no output (WASI compatibility, not JIT-related)
+- E2E segfault on Mac (0xaaaaaaaaaaaaaab2 — use-after-free poison in e2e_runner)
+- Go WASI: 3 Go programs produce no output (Mac + Ubuntu)
+- cpp_string_ops: 25000 vs 24995 on Ubuntu x86_64 only
+- c_hello_wasi: EXIT=71 on Ubuntu (WASI issue)
