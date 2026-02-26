@@ -1176,6 +1176,9 @@ pub const Compiler = struct {
     call_indirect_addr: u64,
     pool64: []const u64,
     has_memory: bool,
+    has_self_call: bool,
+    self_call_only: bool,
+    self_call_entry_offset: u32,
     self_func_idx: u32,
     param_count: u16,
     result_count: u16,
@@ -1228,6 +1231,9 @@ pub const Compiler = struct {
             .call_indirect_addr = 0,
             .pool64 = &.{},
             .has_memory = false,
+            .has_self_call = false,
+            .self_call_only = false,
+            .self_call_entry_offset = 0,
             .self_func_idx = 0,
             .param_count = 0,
             .result_count = 0,
@@ -1363,24 +1369,70 @@ pub const Compiler = struct {
         // Sub 8 to restore 16-byte alignment required by System V ABI for CALLs.
         Enc.subImm32(&self.code, self.alloc, .rsp, 8);
 
-        // Move arguments to callee-saved registers
-        // RDI=regs_ptr → R12, RSI=vm_ptr (save to stack), RDX=instance_ptr (save to stack)
-        Enc.movRegReg(&self.code, self.alloc, REGS_PTR, .rdi); // R12 = regs_ptr
+        if (self.has_self_call) {
+            // Store marker [RSP] = 1 for normal entry (epilogue discrimination)
+            self.emitLoadImm32(SCRATCH2, 1);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 0, SCRATCH2);
+        }
 
-        // Save vm_ptr and instance_ptr to regs array (after virtual regs)
-        // regs[reg_count+2] = vm_ptr, regs[reg_count+3] = instance_ptr
-        // (Same convention as ARM64 backend)
-        const vm_offset: i32 = (@as(i32, self.reg_count) + 2) * 8;
-        const inst_offset: i32 = (@as(i32, self.reg_count) + 3) * 8;
-        Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, vm_offset, .rsi);
-        Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, inst_offset, .rdx);
+        // Branch over self-call entry to shared setup
+        var jmp_shared_offset: u32 = 0;
+        if (self.has_self_call) {
+            jmp_shared_offset = Enc.jmpRel32(&self.code, self.alloc);
+        }
 
-        // Load memory cache BEFORE loading virtual registers.
-        // emitLoadMemCache() calls jitGetMemInfo via CALL, which trashes all
-        // caller-saved registers. Loading vregs after ensures their values
-        // in RCX, RDI, RSI, RDX, R8-R11 are not corrupted by the call.
-        if (self.has_memory) {
-            self.emitLoadMemCache();
+        if (self.has_self_call) {
+            // --- Self-call entry point ---
+            // Self-calls CALL here directly; skips callee-saved pushes.
+            // Stack: CALL pushed return addr (8 bytes). Sub 8 for alignment.
+            self.self_call_entry_offset = self.currentOffset();
+            Enc.subImm32(&self.code, self.alloc, .rsp, 8);
+            // Store marker [RSP] = 0 for self-call (epilogue discrimination)
+            Enc.xorRegReg32(&self.code, self.alloc, SCRATCH2, SCRATCH2);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 0, SCRATCH2);
+            // RDI = callee regs pointer (set by caller)
+            Enc.movRegReg(&self.code, self.alloc, REGS_PTR, .rdi);
+            // Skip memory cache load and shared setup — memory regs preserved
+            // from caller (callee-saved R13/R14). vm/inst already in callee frame.
+        }
+
+        // Vreg loading target for self-call path (falls through from above)
+        // and for normal path (after shared setup, patched below).
+        // We need separate markers: self-call falls through to vreg load,
+        // normal path jumps to shared_setup then to vreg load.
+
+        // Emit shared setup for normal path
+        if (self.has_self_call) {
+            // Self-call entry falls through to vreg loading — jump over shared setup.
+            const jmp_vreg_offset = Enc.jmpRel32(&self.code, self.alloc);
+
+            // Patch JMP from normal entry to here (shared setup)
+            Enc.patchRel32(self.code.items, jmp_shared_offset, self.currentOffset());
+
+            // --- Normal entry shared setup ---
+            Enc.movRegReg(&self.code, self.alloc, REGS_PTR, .rdi); // R12 = regs_ptr
+            const vm_offset: i32 = (@as(i32, self.reg_count) + 2) * 8;
+            const inst_offset: i32 = (@as(i32, self.reg_count) + 3) * 8;
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, vm_offset, .rsi);
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, inst_offset, .rdx);
+
+            if (self.has_memory) {
+                self.emitLoadMemCache();
+            }
+
+            // Patch JMP from self-call entry to here (vreg loading)
+            Enc.patchRel32(self.code.items, jmp_vreg_offset, self.currentOffset());
+        } else {
+            // No self-call: normal setup directly
+            Enc.movRegReg(&self.code, self.alloc, REGS_PTR, .rdi); // R12 = regs_ptr
+            const vm_offset: i32 = (@as(i32, self.reg_count) + 2) * 8;
+            const inst_offset: i32 = (@as(i32, self.reg_count) + 3) * 8;
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, vm_offset, .rsi);
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, inst_offset, .rdx);
+
+            if (self.has_memory) {
+                self.emitLoadMemCache();
+            }
         }
 
         // Load virtual registers from regs array into physical registers.
@@ -1444,8 +1496,24 @@ pub const Compiler = struct {
 
         // Return success (RAX = 0)
         Enc.xorRegReg32(&self.code, self.alloc, .rax, .rax);
+        self.emitCalleeSavedRestore();
+    }
 
-        // Undo alignment padding + restore callee-saved registers
+    /// Emit callee-saved register restore sequence.
+    /// For self-call functions: checks [RSP] marker to determine restore path.
+    /// Marker = 0 → self-call entry (only sub rsp 8), marker != 0 → normal entry (full restore).
+    fn emitCalleeSavedRestore(self: *Compiler) void {
+        if (self.has_self_call) {
+            // Load marker from [RSP]
+            Enc.loadDisp32(&self.code, self.alloc, SCRATCH2, .rsp, 0);
+            Enc.testRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH2);
+            const jnz_normal = Enc.jccRel32(&self.code, self.alloc, .ne);
+            // Self-call path: just undo alignment and return
+            Enc.addImm32(&self.code, self.alloc, .rsp, 8);
+            Enc.ret_(&self.code, self.alloc);
+            // Normal path: full restore
+            Enc.patchRel32(self.code.items, jnz_normal, self.currentOffset());
+        }
         Enc.addImm32(&self.code, self.alloc, .rsp, 8);
         Enc.pop(&self.code, self.alloc, .r15);
         Enc.pop(&self.code, self.alloc, .r14);
@@ -1490,15 +1558,7 @@ pub const Compiler = struct {
         const shared_exit = self.currentOffset();
         self.shared_exit_offset = shared_exit;
         // At this point, RAX has the error code. Restore callee-saved and return.
-        // Undo alignment padding from prologue
-        Enc.addImm32(&self.code, self.alloc, .rsp, 8);
-        Enc.pop(&self.code, self.alloc, .r15);
-        Enc.pop(&self.code, self.alloc, .r14);
-        Enc.pop(&self.code, self.alloc, .r13);
-        Enc.pop(&self.code, self.alloc, .r12);
-        Enc.pop(&self.code, self.alloc, .rbp);
-        Enc.pop(&self.code, self.alloc, .rbx);
-        Enc.ret_(&self.code, self.alloc);
+        self.emitCalleeSavedRestore();
 
         for (self.error_stubs.items) |stub| {
             if (stub.error_code == 0) {
@@ -1821,6 +1881,155 @@ pub const Compiler = struct {
         // 7. Reload and load result
         self.reloadCallerSaved();
         self.reloadVreg(instr.rd);
+    }
+
+    /// Emit inline self-call: bypass trampoline, call directly to self_call_entry.
+    /// Handles: spill, reg_ptr advance, arg copy, call_depth, CALL, restore.
+    fn emitInlineSelfCall(self: *Compiler, rd: u16, data: RegInstr, data2: ?RegInstr, ir: []const RegInstr, call_pc: u32) void {
+        const needed: u32 = @as(u32, self.reg_count) + 4; // +4: mem cache + VM/inst ptrs
+        const needed_bytes: u32 = needed * 8;
+        const n_args = self.param_count;
+
+        // 1. Spill ALL live vregs (including callee-saved vregs 0-2)
+        self.spillCallerSavedLive(ir, call_pc);
+        // Spill callee-saved vregs — self-call entry doesn't save/restore them.
+        for (0..@min(self.reg_count, FIRST_CALLER_SAVED_VREG)) |i| {
+            self.spillVreg(@intCast(i));
+        }
+        // Spill arg vregs unconditionally (needed even if dead after call)
+        self.spillVreg(data.rd);
+        if (n_args > 1) self.spillVreg(data.rs1);
+        if (n_args > 2) self.spillVreg(data.rs2_field);
+        if (n_args > 3) self.spillVreg(@truncate(data.operand));
+        if (n_args > 4) {
+            if (data2) |d2| {
+                if (n_args > 4) self.spillVreg(d2.rd);
+                if (n_args > 5) self.spillVreg(d2.rs1);
+                if (n_args > 6) self.spillVreg(d2.rs2_field);
+                if (n_args > 7) self.spillVreg(@truncate(d2.operand));
+            }
+        }
+
+        // 2. Load vm_ptr into SCRATCH2 for reg_ptr/call_depth access
+        self.emitLoadVmPtr(SCRATCH2);
+
+        // 3. Advance reg_ptr: load current, add needed, check overflow, store back
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, SCRATCH2, @intCast(self.reg_ptr_offset));
+        Enc.addImm32(&self.code, self.alloc, SCRATCH, @intCast(needed));
+        // Check: new reg_ptr > REG_STACK_SIZE → stack overflow
+        Enc.cmpImm32(&self.code, self.alloc, SCRATCH, vm_mod.REG_STACK_SIZE);
+        self.emitCondError(.a, 2); // StackOverflow
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, @intCast(self.reg_ptr_offset), SCRATCH);
+
+        // 4. Increment call_depth, check MAX_CALL_DEPTH
+        const cd_offset: i32 = @intCast(self.reg_ptr_offset + 8); // call_depth is adjacent
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, SCRATCH2, cd_offset);
+        Enc.cmpImm32(&self.code, self.alloc, SCRATCH, vm_mod.MAX_CALL_DEPTH);
+        self.emitCondError(.ae, 2); // StackOverflow
+        Enc.addImm32(&self.code, self.alloc, SCRATCH, 1);
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, cd_offset, SCRATCH);
+
+        // 5. Compute callee REGS_PTR in RDI: R12 + needed_bytes
+        Enc.movRegReg(&self.code, self.alloc, .rdi, REGS_PTR);
+        Enc.addImm32(&self.code, self.alloc, .rdi, @intCast(needed_bytes));
+
+        // 6. Copy args from caller's physical regs/memory to callee frame
+        self.emitArgCopyDirect(.rdi, data.rd, 0);
+        if (n_args > 1) self.emitArgCopyDirect(.rdi, data.rs1, 8);
+        if (n_args > 2) self.emitArgCopyDirect(.rdi, data.rs2_field, 16);
+        if (n_args > 3) self.emitArgCopyDirect(.rdi, @truncate(data.operand), 24);
+        if (n_args > 4) {
+            if (data2) |d2| {
+                if (n_args > 4) self.emitArgCopyDirect(.rdi, d2.rd, 32);
+                if (n_args > 5) self.emitArgCopyDirect(.rdi, d2.rs1, 40);
+                if (n_args > 6) self.emitArgCopyDirect(.rdi, d2.rs2_field, 48);
+                if (n_args > 7) self.emitArgCopyDirect(.rdi, @truncate(d2.operand), 56);
+            }
+        }
+
+        // 7. Zero-init remaining locals
+        if (n_args < self.local_count) {
+            Enc.xorRegReg32(&self.code, self.alloc, SCRATCH, SCRATCH);
+            for (n_args..self.local_count) |i| {
+                const offset: i32 = @intCast(i * 8);
+                Enc.storeDisp32(&self.code, self.alloc, .rdi, offset, SCRATCH);
+            }
+        }
+
+        // 8. Copy vm_ptr and inst_ptr to callee frame
+        const vm_slot: i32 = (@as(i32, self.reg_count) + 2) * 8;
+        const inst_slot: i32 = (@as(i32, self.reg_count) + 3) * 8;
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, REGS_PTR, vm_slot);
+        Enc.storeDisp32(&self.code, self.alloc, .rdi, vm_slot, SCRATCH);
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, REGS_PTR, inst_slot);
+        Enc.storeDisp32(&self.code, self.alloc, .rdi, inst_slot, SCRATCH);
+
+        // 9. CALL self_call_entry (direct, no trampoline)
+        // Emit CALL rel32 — target is self_call_entry_offset in the code buffer.
+        const call_site = self.currentOffset();
+        const call_rel32_off = Enc.callRel32(&self.code, self.alloc);
+        Enc.patchRel32(self.code.items, call_rel32_off, self.self_call_entry_offset);
+        _ = call_site;
+
+        // 10. Restore REGS_PTR (R12): callee clobbered it, recover from callee base.
+        // callee's R12 = caller's R12 + needed_bytes, so subtract to restore.
+        Enc.subImm32(&self.code, self.alloc, REGS_PTR, @intCast(needed_bytes));
+
+        // Save error code (RAX) to RCX — steps 11-12 use SCRATCH (RAX) as temp.
+        Enc.movRegReg(&self.code, self.alloc, .rcx, .rax);
+
+        // 11. Decrement call_depth (unconditionally — must balance even on error)
+        self.emitLoadVmPtr(SCRATCH2);
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, SCRATCH2, cd_offset);
+        Enc.subImm32(&self.code, self.alloc, SCRATCH, 1);
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, cd_offset, SCRATCH);
+
+        // 12. Restore reg_ptr
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, SCRATCH2, @intCast(self.reg_ptr_offset));
+        Enc.subImm32(&self.code, self.alloc, SCRATCH, @intCast(needed));
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, @intCast(self.reg_ptr_offset), SCRATCH);
+
+        // 13. Restore error code from RCX back to RAX, then check.
+        Enc.movRegReg(&self.code, self.alloc, .rax, .rcx);
+        Enc.testRegReg(&self.code, self.alloc, .rax, .rax);
+        const rel32_off = Enc.jccRel32(&self.code, self.alloc, .ne);
+        self.error_stubs.append(self.alloc, .{
+            .rel32_offset = rel32_off,
+            .error_code = 0,
+            .kind = .jne,
+            .cond = .ne,
+        }) catch {};
+
+        // 13. Reload memory cache (memory may have grown during call)
+        if (self.has_memory) {
+            self.emitLoadMemCache();
+        }
+
+        // 14. Copy callee's result (regs[0] at R12+needed_bytes) to caller's rd slot.
+        // The callee's epilogue stored result in callee's regs[0].
+        // After R12 restore, callee frame starts at R12 + needed_bytes.
+        if (self.result_count > 0) {
+            Enc.loadDisp32(&self.code, self.alloc, SCRATCH, REGS_PTR, @intCast(needed_bytes));
+            const rd_disp: i32 = @as(i32, rd) * 8;
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, rd_disp, SCRATCH);
+        }
+
+        // 15. Reload ALL vregs (including callee-saved 0-2)
+        self.reloadCallerSavedLive();
+        // Reload callee-saved vregs (0-2) that were spilled in step 1
+        for (0..@min(self.reg_count, FIRST_CALLER_SAVED_VREG)) |i| {
+            self.reloadVreg(@intCast(i));
+        }
+        // Reload result (now contains callee's return value from step 14)
+        self.reloadVreg(rd);
+    }
+
+    /// Copy arg vreg from caller's spilled memory to callee frame.
+    /// Must use memory (not physical regs) because regs may have been clobbered.
+    fn emitArgCopyDirect(self: *Compiler, callee_base: Reg, arg_vreg: u16, callee_offset: i32) void {
+        const src_disp: i32 = @as(i32, arg_vreg) * 8;
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, REGS_PTR, src_disp);
+        Enc.storeDisp32(&self.code, self.alloc, callee_base, callee_offset, SCRATCH);
     }
 
     /// Spill a single vreg unconditionally to regs[]. Required for call args
@@ -2772,6 +2981,23 @@ pub const Compiler = struct {
 
         self.has_memory = jit_mod.Compiler.scanForMemoryOps(reg_func.code);
 
+        // Scan IR for self-calls and other calls
+        var found_self_call = false;
+        var found_other_call = false;
+        for (reg_func.code) |instr| {
+            if (instr.op == regalloc_mod.OP_CALL) {
+                if (instr.operand == self_func_idx) {
+                    found_self_call = true;
+                } else {
+                    found_other_call = true;
+                }
+            } else if (instr.op == regalloc_mod.OP_CALL_INDIRECT) {
+                found_other_call = true;
+            }
+        }
+        self.has_self_call = found_self_call;
+        self.self_call_only = found_self_call and !found_other_call;
+
         self.emitPrologue();
 
         const ir = reg_func.code;
@@ -2941,7 +3167,11 @@ pub const Compiler = struct {
                     data2 = ir[pc.*];
                     pc.* += 1;
                 }
-                self.emitCall(instr.rd, func_idx, n_args, data, if (has_data2) data2 else null, ir, call_pc);
+                if (self.has_self_call and func_idx == self.self_func_idx) {
+                    self.emitInlineSelfCall(instr.rd, data, if (has_data2) data2 else null, ir, call_pc);
+                } else {
+                    self.emitCall(instr.rd, func_idx, n_args, data, if (has_data2) data2 else null, ir, call_pc);
+                }
             },
             regalloc_mod.OP_CALL_INDIRECT => {
                 const data = ir[pc.*];
