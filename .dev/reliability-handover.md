@@ -24,8 +24,8 @@
 #### E2E + DIFF fixes
 - [x] **R1**: E2E segfault fix — JIT self-call stack overflow use-after-free (d289d44)
 - [x] **R2**: Go WASI fix — back-edge JIT restart corrupts Go state machine (skip for side-effect functions)
-- [ ] **R3**: cpp_string_ops Ubuntu fix — 25000 vs 24995 (x86_64 only)
-- [ ] **R4**: c_hello_wasi Ubuntu fix — EXIT=71 (WASI issue)
+- [x] **R3**: cpp_string_ops Ubuntu fix — same root cause as R2 (back-edge JIT restart)
+- [x] **R4**: c_hello_wasi Ubuntu fix — same root cause as R2 (back-edge JIT restart)
 
 #### Test expansion (12 → 30)
 - [ ] **R5**: Add 18 new real-world test programs across C/C++/Go/Rust
@@ -102,7 +102,4 @@ gc_alloc 0.50x, gc_tree 0.73x
 None.
 
 ## Known Bugs
-- E2E segfault on Mac (0xaaaaaaaaaaaaaab2 — use-after-free poison in e2e_runner)
-- Go WASI: 3 Go programs produce no output (Mac + Ubuntu)
-- cpp_string_ops: 25000 vs 24995 on Ubuntu x86_64 only
-- c_hello_wasi: EXIT=71 on Ubuntu (WASI issue)
+None — all previously known bugs fixed (R1-R4).

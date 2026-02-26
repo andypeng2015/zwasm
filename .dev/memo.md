@@ -33,10 +33,7 @@ regalloc limits, GC JIT. All merged to main at f654cc9.
 
 ## Known Bugs
 
-- E2E segfault on Mac (0xaaaaaaaaaaaaaab2 — use-after-free poison in e2e_runner)
-- Go WASI: 3 Go programs produce no output (Mac + Ubuntu)
-- cpp_string_ops: 25000 vs 24995 on Ubuntu x86_64 only
-- c_hello_wasi: EXIT=71 on Ubuntu (WASI issue)
+None — all previously known bugs fixed (R1: E2E segfault, R2-R4: back-edge JIT restart).
 
 ## References
 
