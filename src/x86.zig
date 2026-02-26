@@ -426,6 +426,22 @@ const Enc = struct {
         buf.append(alloc, modrm(0b11, 7, dst.low3())) catch {};
     }
 
+    /// SHR r64, imm8: REX.W C1 /5 ib
+    fn shrImm(buf: *std.ArrayList(u8), alloc: Allocator, dst: Reg, imm: u6) void {
+        buf.append(alloc, rexW1(dst)) catch {};
+        buf.append(alloc, 0xC1) catch {};
+        buf.append(alloc, modrm(0b11, 5, dst.low3())) catch {};
+        buf.append(alloc, @intCast(imm)) catch {};
+    }
+
+    /// SHR r32, imm8: C1 /5 ib
+    fn shrImm32(buf: *std.ArrayList(u8), alloc: Allocator, dst: Reg, imm: u5) void {
+        if (dst.isExt()) buf.append(alloc, rex(false, false, false, true)) catch {};
+        buf.append(alloc, 0xC1) catch {};
+        buf.append(alloc, modrm(0b11, 5, dst.low3())) catch {};
+        buf.append(alloc, @intCast(imm)) catch {};
+    }
+
     /// ROL r64, CL: REX.W D3 /0
     fn rolCl(buf: *std.ArrayList(u8), alloc: Allocator, dst: Reg) void {
         buf.append(alloc, rexW1(dst)) catch {};
@@ -3704,7 +3720,64 @@ pub const Compiler = struct {
     // --- Division helpers ---
     // x86 uses RAX/RDX for division. RAX = SCRATCH, RDX = vreg 6.
 
+    const MagicU32 = struct { magic: u32, shift: u6 };
+
+    /// Compute magic multiplier for unsigned 32-bit division by constant.
+    /// Returns (magic, shift) such that: floor(n/d) = floor((u64(n) * magic) >> shift)
+    fn computeMagicU32(d: u32) ?MagicU32 {
+        if (d < 2) return null;
+        if (d & (d - 1) == 0) return null; // power of 2 handled separately
+        for (32..64) |p| {
+            const two_p: u64 = @as(u64, 1) << @intCast(p);
+            const magic: u64 = (two_p + d - 1) / d;
+            if (magic > 0xFFFFFFFF) continue;
+            const rem = two_p % d;
+            const err = if (rem == 0) 0 else d - @as(u32, @intCast(rem));
+            if (@as(u64, err) * 0xFFFFFFFF < two_p) {
+                return .{ .magic = @intCast(magic), .shift = @intCast(p) };
+            }
+        }
+        return null;
+    }
+
+    /// Emit unsigned division by known constant using multiply-by-reciprocal.
+    /// x86_64: IMUL r64,r64 for 32×32→64, then SHR r64,shift.
+    fn tryEmitDivByConstU32(self: *Compiler, instr: RegInstr, divisor: u32) bool {
+        // Power of 2: just SHR
+        if (divisor & (divisor - 1) == 0) {
+            const shift: u5 = @intCast(@ctz(divisor));
+            const rs1 = self.getOrLoad(instr.rs1, SCRATCH);
+            if (rs1 != SCRATCH) Enc.movRegReg32(&self.code, self.alloc, SCRATCH, rs1);
+            Enc.shrImm32(&self.code, self.alloc, SCRATCH, shift);
+            self.storeVreg(instr.rd, SCRATCH);
+            return true;
+        }
+        const m = computeMagicU32(divisor) orelse return false;
+        // Load dividend into SCRATCH (zero-extended to 64 bits via MOV r32)
+        const rs1 = self.getOrLoad(instr.rs1, SCRATCH);
+        if (rs1 != SCRATCH) Enc.movRegReg32(&self.code, self.alloc, SCRATCH, rs1);
+        // Load magic constant into SCRATCH2
+        self.emitLoadImm32(SCRATCH2, m.magic);
+        // IMUL r64, r64: SCRATCH = (u64)n * (u64)magic (both < 2^32, product < 2^64)
+        Enc.imulRegReg(&self.code, self.alloc, SCRATCH, SCRATCH2);
+        // SHR r64, shift: extract quotient from high bits
+        Enc.shrImm(&self.code, self.alloc, SCRATCH, m.shift);
+        self.storeVreg(instr.rd, SCRATCH);
+        return true;
+    }
+
     fn emitDiv32(self: *Compiler, instr: RegInstr, signed: bool, is_rem: bool) void {
+        // Fast path: unsigned division by known constant
+        if (!signed and !is_rem) {
+            const rs2_vreg = instr.rs2();
+            if (rs2_vreg < 128) {
+                if (self.known_consts[rs2_vreg]) |d| {
+                    if (d >= 2 and self.tryEmitDivByConstU32(instr, d))
+                        return;
+                }
+            }
+        }
+
         const rs2 = instr.rs2();
         const r1 = self.getOrLoad(instr.rs1, SCRATCH);
         const divisor = self.getOrLoad(rs2, SCRATCH2);
