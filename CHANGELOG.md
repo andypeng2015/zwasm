@@ -3,15 +3,19 @@
 All notable changes to zwasm are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [1.2.0] - 2026-02-27
 
 ### Added
 - Real-world compatibility tests: 30 programs (C, C++, Go, Rust) verified against wasmtime
 - On-Stack Replacement (OSR) for back-edge JIT: enter at loop body, bypass prologue side effects
+- Spec test strict mode: `--strict` flag exits non-zero on skips, enforced in CI
 - 11 new unit tests (521 total)
 - E2E tests expanded: 792/792 assertions (from 356)
 
 ### Fixed
+- Spec validation: 87 previously skipped tests now enforced (GC typed references, subtyping, table types, exception handling catch clauses, rec group boundaries)
+- Spec infra: 18 `assert_exception` tests now handled by spec runner
+- E2E memory leak: `errdefer` in void-returning function was a no-op in Zig 0.15
 - JIT self-call stack overflow use-after-free (E2E segfault on aarch64)
 - Back-edge JIT restart corrupting Go WASI state machines (side-effect detection)
 - ARM64 OSR prologue: push FP callee-saved d8-d15 (stack corruption fix)
@@ -21,10 +25,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Go state machine detection: br_table boundary inclusive of target instruction
 
 ### Changed
+- Spec tests: 62,263/62,263 passed (100.0%, 0 skip — up from 62,158 with 105 skips)
 - Benchmark results: 20/29 match or beat wasmtime, 27/29 within 1.5x (up from 14/23)
 - st_sieve: 0.97x wasmtime (restored from 30.82x regression via OSR)
 - GC benchmarks: gc_alloc 0.50x, gc_tree 0.73x wasmtime (JIT for struct ops)
 - nbody: 0.97x wasmtime (FP cache D2-D15 expansion)
+- Nightly CI: spec tests now run ReleaseSafe (eliminates Debug tail-call timeouts)
 
 ## [1.1.0] - 2026-02-18
 
