@@ -4,23 +4,20 @@ Session handover document. Read at session start.
 
 ## Current State
 
-- Stages 0-46 complete. v1.1.0 released. ~50K LOC, 521 unit tests.
-- Spec: 62,263/62,263 Mac (100.0%, 0 skip). E2E: 792/792 (100.0%, 0 leak).
+- Stages 0-46 complete. v1.2.0 released. ~50K LOC, 521 unit tests.
+- Spec: 62,263/62,263 Mac+Ubuntu (100.0%, 0 skip). E2E: 792/792 (100.0%, 0 leak).
 - Wasm 3.0: all 9 proposals. WASI: 46/46 (100%). WAT parser complete.
-- JIT: Register IR + ARM64/x86_64. Size: ~1.4MB / ~3.5MB RSS.
-- **main = stable**: ClojureWasm depends on main (v1.1.0 tag).
+- JIT: Register IR + ARM64/x86_64. Size: 1.19MB / 1.52MB RSS.
+- **main = stable**: ClojureWasm depends on main (v1.2.0 tag).
 
 ## Current Task
 
-Gate hardening (branch: `strictly-check/gate-hardening`). Ready for merge.
+v1.2.0 released (tagged, pushed, CW updated).
 
-**gate-hardening: Zero-skip/zero-leak + gate enforcement**
-- [x] T1: nightly.yml — Debug spec test → ReleaseSafe (eliminates 11 tail-call timeouts)
-- [x] T2: E2E runner memory leak fix (errdefer in void function was no-op)
-- [x] T3: Fix all 87 spec validation skips (validate.zig: GC types, subtyping, tables, exceptions)
-- [x] T4: Fix all 18 spec infra skips (run_spec.py: add assert_exception handler)
-- [x] T5: Harden gate docs (CLAUDE.md, SKILL.md, bench/record.sh)
-- [x] T6: Add --strict mode to run_spec.py, enable in CI
+## Previous Task (gate-hardening)
+
+All merged to main. Zero-skip/zero-leak + gate enforcement:
+- T1-T6 complete. Spec 62,263/0/0, E2E 792/0/0, Compat 30/0/0.
 
 ## Previous Task
 
