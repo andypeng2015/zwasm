@@ -4,30 +4,24 @@ Session handover document. Read at session start.
 
 ## Current State
 
-- Stages 0-46 complete. v1.2.0 released. ~50K LOC, 521 unit tests.
+- Stages 0-46 + Phase 1 complete. v1.3.0 candidate (pending release).
 - Spec: 62,263/62,263 Mac+Ubuntu (100.0%, 0 skip). E2E: 792/792 (100.0%, 0 leak).
 - Wasm 3.0: all 9 proposals. WASI: 46/46 (100%). WAT parser complete.
-- JIT: Register IR + ARM64/x86_64. Size: 1.19MB / 1.52MB RSS.
-- **main = stable**: ClojureWasm depends on main (v1.2.0 tag).
+- JIT: Register IR + ARM64/x86_64. Size: 1.3MB stripped.
+- Module cache: `zwasm run --cache`, `zwasm compile` (D124).
+- **main = stable**: Phase 1 merged. ClojureWasm depends on main.
 
 ## Current Task
 
-Phase 1 complete. Ready for Merge Gate → v1.3.0.
+Phase 1 merged to main. Next: v1.3.0 release, then Phase 3.
 
-### Completed: Phase 1 — Guard Pages + Module Cache
+Merge Gate passed (Mac + Ubuntu): spec 62,263, E2E 792/792, real-world 30/30.
 
-**1.1 Guard Pages**: Already implemented (guard.zig, memory.zig, store.zig, jit.zig,
-x86.zig, cli.zig). JIT bounds check elimination active.
+**Next steps**:
+1. Tag v1.3.0 + update CW dependency (use `/release` skill)
+2. Phase 3: CI Automation + Documentation (see `roadmap.md`)
 
-**1.2 Module Cache (D124)**: Implemented. `cache.zig` serializes predecoded IR
-(`PreInstr` + `pool64`) to `~/.cache/zwasm/<hash>.zwcache`.
-CLI: `zwasm run --cache` (auto-load/save), `zwasm compile` (AOT predecode).
-Mac Commit Gate passed: spec 62,263, E2E 792/792, real-world 30/30.
-
-**Next**: Merge Gate (Mac + Ubuntu), then v1.3.0 release.
-After that: Phase 3 (CI Automation + Documentation).
-
-Previous: v1.2.0 released (tagged 5d54ae9, CW updated).
+Previous: Phase 1 (guard pages + module cache) merged to main.
 
 ## Known Bugs
 
