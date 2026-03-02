@@ -13,19 +13,11 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-Branch `bench/cache-variants`: Added cached benchmark variants to all 5 bench scripts.
-Recorded `phase1-cached` in history.yaml (58 benchmarks: 29 uncached + 29 cached).
-Recorded runtime_comparison.yaml with zwasm_cached + wasmtime_cached entries.
-
-**Done on this branch**:
-- run_bench.sh, record.sh, compare_runtimes.sh, record_comparison.sh, ci_compare.sh
-- All support `--no-cache` for backward compatibility
-- bench-strategy.md updated with Cached Benchmarks section
+Cached benchmark variants merged to main. All scripts now show uncached + cached side-by-side.
 
 **Next steps**:
-1. Merge bench/cache-variants to main
-2. Tag v1.3.0 + update CW dependency (use `/release` skill)
-3. Phase 3: CI Automation + Documentation (see `roadmap.md`)
+1. Tag v1.3.0 + update CW dependency (use `/release` skill)
+2. Phase 3: CI Automation + Documentation (see `roadmap.md`)
 
 ## Known Bugs
 
