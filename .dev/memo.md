@@ -13,18 +13,25 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-Phase 3 (CI Automation + Documentation) complete on `phase3/ci-docs`.
+**Phase 5: C API + Conditional Compilation** — branch `phase5/c-api`
 
-**Done**:
-- CI: centralized tool-versions, spec-bump, wasm-tools-bump, spectec-monitor workflows
-- Nightly re-enabled as weekly
-- D125 decision, proposal-watch.md
-- ARCHITECTURE.md, docs/data-structures.md
-- Doc comments on fuzz files, affected-file refs on all D## entries
+### 5.1 C API (wasm-c-api)
+- D126 decision record
+- `src/c_api.zig`: export engine/store/module/instance/func/memory/val via C ABI
+- WASI config C API
+- `include/zwasm.h` header
+- `libzwasm.so` / `libzwasm.dylib` shared library build
+- C test + Python ctypes example
 
-**Next steps**:
-1. Merge `phase3/ci-docs` to main (after Merge Gate)
-2. Phase 5: C API + Conditional Compilation (see `roadmap.md`)
+### 5.2 Conditional Compilation
+- `-Djit=false`, `-Dsimd=false`, `-Dgc=false`, `-Dthreads=false`, `-Dcomponent=false`
+- Minimal build (MVP+WASI, no JIT) target < 500KB
+- CI size matrix
+
+### Design Notes
+- Reference: wasm-c-api spec (https://github.com/WebAssembly/wasm-c-api)
+- Reference: wasmtime C API (`~/Documents/OSS/wasmtime/crates/c-api/`)
+- Zig C ABI export: `export fn` + `callconv(.c)`
 
 ## Known Bugs
 
