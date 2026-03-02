@@ -10,9 +10,17 @@ All 9 Wasm 3.0 proposals plus threads, wide arithmetic, and custom page sizes. S
 
 Not currently. zwasm runs on macOS (ARM64) and Linux (x86_64, aarch64). The JIT and memory guard pages use POSIX APIs (mmap, mprotect, signal handlers).
 
+### Can I use zwasm from C, Python, or other languages?
+
+Yes. zwasm provides a C API (`libzwasm`) that any FFI-capable language can use. Build with `zig build lib` to produce the shared library, then call `zwasm_*` functions via your language's FFI mechanism (e.g., Python `ctypes`, Rust `extern "C"`, Go `cgo`). See [C API & Cross-Language Integration](./c-api.md).
+
+### Can I reduce the binary size?
+
+Yes. Use build-time feature flags to strip features you do not need: `-Djit=false` (no JIT, −16%), `-Dcomponent=false` (no Component Model, −8%), `-Dwat=false` (no WAT parser, −6%). Combining all three produces a ~940 KB minimal binary (−24%). See [Build Configuration](./build-configuration.md).
+
 ### Can I use zwasm without JIT?
 
-Yes. The interpreter handles all functions by default. JIT is only triggered for hot functions. There is no way to disable JIT for specific functions, but functions that are called fewer than ~8 times will always use the interpreter.
+Yes. The interpreter handles all functions by default. JIT is only triggered for hot functions. To build without JIT entirely, use `-Djit=false` — this removes the JIT compiler from the binary and reduces its size by ~16%. Functions that are called fewer than ~8 times will always use the interpreter regardless.
 
 ### What is the WAT parser?
 

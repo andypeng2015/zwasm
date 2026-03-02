@@ -200,3 +200,5 @@ const mod = try WasmModule.load(arena.allocator(), wasm_bytes);
 - **Internal**: ライブラリ利用者からはアクセスできません。`types.zig` 以外のソースファイル内のすべての型が対象です。
 
 完全なリストは [docs/api-boundary.md](https://github.com/clojurewasm/zwasm/blob/main/docs/api-boundary.md) を参照してください。
+
+> **Zig 以外の言語をお使いですか?** zwasm は C API (`libzwasm`) も提供しており、FFI を持つ任意の言語 — C、Python、Rust、Go など — から利用できます。[C API とクロスランゲージ連携](./c-api.md)を参照してください。

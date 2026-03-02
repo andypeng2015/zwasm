@@ -7,6 +7,8 @@
 - [Getting Started](./getting-started.md)
 - [CLI Reference](./cli-reference.md)
 - [Embedding Guide](./embedding-guide.md)
+- [C API & Cross-Language Integration](./c-api.md)
+- [Build Configuration](./build-configuration.md)
 - [FAQ & Troubleshooting](./faq.md)
 
 # Technical Reference

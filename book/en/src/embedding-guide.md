@@ -200,3 +200,5 @@ Types and functions are classified into three stability levels:
 - **Internal**: Not accessible to library consumers. All types in source files other than `types.zig`.
 
 See [docs/api-boundary.md](https://github.com/clojurewasm/zwasm/blob/main/docs/api-boundary.md) for the complete list.
+
+> **Using a non-Zig language?** zwasm also exposes a C API (`libzwasm`) that works with any FFI-capable language — C, Python, Rust, Go, and more. See [C API & Cross-Language Integration](./c-api.md).

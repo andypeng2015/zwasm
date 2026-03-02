@@ -7,6 +7,8 @@
 - [クイックスタート](./getting-started.md)
 - [CLI リファレンス](./cli-reference.md)
 - [組み込みガイド](./embedding-guide.md)
+- [C API とクロスランゲージ連携](./c-api.md)
+- [ビルド設定](./build-configuration.md)
 - [FAQ・トラブルシューティング](./faq.md)
 
 # 技術リファレンス
