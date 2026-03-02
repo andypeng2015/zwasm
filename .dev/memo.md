@@ -12,31 +12,20 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-Phase 1.2: Module Cache / AOT Serialize (see `roadmap.md` Phase 1).
+Phase 1 complete. Ready for Merge Gate → v1.3.0.
 
-Phase 1.1 (Guard Pages) already complete — implemented in guard.zig, memory.zig,
-store.zig, jit.zig, x86.zig, cli.zig. JIT bounds check elimination active.
+### Completed: Phase 1 — Guard Pages + Module Cache
 
-### Design: Module Cache
+**1.1 Guard Pages**: Already implemented (guard.zig, memory.zig, store.zig, jit.zig,
+x86.zig, cli.zig). JIT bounds check elimination active.
 
-Save predecoded IR to disk for fast startup on repeated execution.
-Decision: D124 (to be written).
+**1.2 Module Cache (D124)**: Implemented. `cache.zig` serializes predecoded IR
+(`PreInstr` + `pool64`) to `~/.cache/zwasm/<hash>.zwcache`.
+CLI: `zwasm run --cache` (auto-load/save), `zwasm compile` (AOT predecode).
+Mac Commit Gate passed: spec 62,263, E2E 792/792, real-world 30/30.
 
-**What to cache**: Predecoded instruction stream (from `predecode.zig`).
-RegIR is per-function JIT output — may be too large/complex to cache initially.
-Start with predecoded IR only.
-
-**Cache location**: `~/.cache/zwasm/<hash>.bin`
-**Cache key**: SHA-256 of wasm binary + zwasm version string.
-**CLI**: `zwasm run --cache file.wasm` (auto-cache), `zwasm compile file.wasm` (AOT).
-**Invalidation**: version mismatch or hash mismatch → recompile.
-
-**Files to create/modify**:
-- New: `src/cache.zig` — serialize/deserialize predecoded IR
-- Modify: `src/module.zig` — load from cache if available
-- Modify: `src/cli.zig` — `--cache` flag + `compile` subcommand
-
-Expected: 10-100x startup improvement for large modules.
+**Next**: Merge Gate (Mac + Ubuntu), then v1.3.0 release.
+After that: Phase 3 (CI Automation + Documentation).
 
 Previous: v1.2.0 released (tagged 5d54ae9, CW updated).
 

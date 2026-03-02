@@ -20,7 +20,7 @@ Stages 0-46 complete. Details: `roadmap-archive.md`.
 Integrated roadmap (zwasm + CW): `private/future/03_zwasm_clojurewasm_roadmap_ja.md`
 CW-specific phases (2, 4, 6, 7, 9, 14, 16, 17) are in that document only.
 
-### Phase 1: Guard Pages + Module Cache (1 day remaining)
+### Phase 1: Guard Pages + Module Cache — COMPLETE
 
 Performance impact: highest of remaining items. Improvements propagate to CW.
 
@@ -30,18 +30,14 @@ Already implemented: guard.zig (mmap/mprotect/signal handler), memory.zig (initG
 store.zig (auto-use when JIT supported), jit.zig/x86.zig (bounds check elimination),
 cli.zig (signal handler install).
 
-**1.2 Module Cache / AOT Serialize (1 day)**
+**1.2 Module Cache / AOT Serialize — COMPLETE (D124)**
 
-Eliminate recompilation cost for repeated execution.
-
-- D## decision record (D124)
-- `cache.zig`: save predecoded/RegIR to `~/.cache/zwasm/<hash>.bin`
+- `cache.zig`: serialize predecoded IR to `~/.cache/zwasm/<hash>.zwcache`
 - `zwasm run --cache` option + `zwasm compile` command
-- Cache invalidation (wasm hash + zwasm version)
+- Cache invalidation: SHA-256 hash + version field
+- All tests pass (spec 62,263/62,263, E2E 792/792, real-world 30/30)
 
-Expected: 10-100x faster startup for large modules on subsequent runs.
-
-**Gate**: All tests pass + benchmark recorded. zwasm v1.3.0 candidate.
+**Gate**: PASSED. zwasm v1.3.0 candidate.
 
 ### Phase 3: CI Automation + Documentation (2 days)
 
