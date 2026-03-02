@@ -4,20 +4,19 @@ Session handover document. Read at session start.
 
 ## Current State
 
-- Stages 0-46 + Phase 1 complete. v1.3.0 candidate (pending release).
+- Stages 0-46 + Phase 1 complete. **v1.3.0 released** (tagged 7570170).
 - Spec: 62,263/62,263 Mac+Ubuntu (100.0%, 0 skip). E2E: 792/792 (100.0%, 0 leak).
 - Wasm 3.0: all 9 proposals. WASI: 46/46 (100%). WAT parser complete.
-- JIT: Register IR + ARM64/x86_64. Size: 1.3MB stripped.
+- JIT: Register IR + ARM64/x86_64. Size: 1.20MB stripped. RSS: 4.48MB.
 - Module cache: `zwasm run --cache`, `zwasm compile` (D124).
-- **main = stable**: Phase 1 merged. ClojureWasm depends on main.
+- **main = stable**: v1.3.0 tagged. ClojureWasm updated to v1.3.0.
 
 ## Current Task
 
-Cached benchmark variants merged to main. All scripts now show uncached + cached side-by-side.
+v1.3.0 released. CW updated to v1.3.0.
 
 **Next steps**:
-1. Tag v1.3.0 + update CW dependency (use `/release` skill)
-2. Phase 3: CI Automation + Documentation (see `roadmap.md`)
+1. Phase 3: CI Automation + Documentation (see `roadmap.md`)
 
 ## Known Bugs
 
