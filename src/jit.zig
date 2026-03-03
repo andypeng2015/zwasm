@@ -4135,34 +4135,34 @@ pub const Compiler = struct {
         // 10b. Reload callee-saved vregs from regs[] (caller saved them before BL).
         self.reloadCalleeSavedLive();
 
-        // 11-12. Copy result and reload caller-saved regs.
-        //     For callee-saved rd: load result directly into physical reg after callee reload.
-        //     For caller-saved rd: reload others first, then load result directly.
-        //     For memory-backed rd: store to memory (no physical reg).
+        // 11-13. Reload memory cache, result, and caller-saved regs.
+        //     emitLoadMemCache calls jitGetMemInfo via BLR which clobbers all caller-saved
+        //     registers (x0-x7, x9-x15). Must reload memory cache BEFORE caller-saved regs,
+        //     matching the same ordering as emitCall (step 5a there).
         const rd_phys = if (self.result_count > 0) vregToPhys(rd) else null;
         const rd_callee_saved = if (rd_phys) |p| (p >= 19 and p <= 28) else false;
 
+        // 11a. Callee-saved result: load before BLR (survives BLR since callee-saved).
         if (self.result_count > 0 and rd_callee_saved) {
-            // Callee-saved: load result (overwrites the just-reloaded pre-call value)
             self.emitLoadCalleeResult(rd_phys.?, needed_bytes);
         }
 
+        // 12. Reload memory cache BEFORE caller-saved regs (BLR clobbers x0-x15).
+        if (self.has_memory) {
+            self.emitLoadMemCache();
+        }
+
+        // 13. Reload caller-saved regs AFTER all BLRs, then caller-saved result last.
         self.reloadCallerSavedLiveExcept(if (rd_phys != null and !rd_callee_saved) rd else null);
 
         if (self.result_count > 0 and !rd_callee_saved) {
             if (rd_phys) |phys| {
-                // Caller-saved: load directly after reload (skipped in reload above)
                 self.emitLoadCalleeResult(phys, needed_bytes);
             } else {
                 // Memory-backed: must go through SCRATCH → memory
                 self.emitLoadCalleeResult(SCRATCH, needed_bytes);
                 self.emit(a64.str64(SCRATCH, REGS_PTR, @as(u16, rd) * 8));
             }
-        }
-
-        // 13. Reload memory cache (memory may have grown during call)
-        if (self.has_memory) {
-            self.emitLoadMemCache();
         }
     }
 
