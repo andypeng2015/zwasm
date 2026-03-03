@@ -1451,8 +1451,7 @@ pub const Compiler = struct {
         };
     }
 
-    /// Spill only caller-saved vregs that are live after the call.
-    /// call_pc: the PC of the OP_CALL instruction in the IR.
+    /// Spill caller-saved vregs that are live after the call.
     fn spillCallerSavedLive(self: *Compiler, ir: []const RegInstr, call_pc: u32) void {
         const max: u8 = @intCast(@min(self.reg_count, MAX_PHYS_REGS));
         if (max <= 5) return;
@@ -1461,9 +1460,8 @@ pub const Compiler = struct {
         for (5..max) |i| {
             const vreg: u16 = @intCast(i);
             if (vreg == 12 or vreg == 13) continue;
-            if (vreg < 128 and (self.written_vregs & (@as(u128, 1) << @as(u7, @intCast(vreg)))) == 0) continue;
-            // Only spill if vreg is live after the call
             if ((live_set & (@as(u32, 1) << @as(u5, @intCast(vreg)))) == 0) continue;
+            if (vreg < 128 and (self.written_vregs & (@as(u128, 1) << @as(u7, @intCast(vreg)))) == 0) continue;
             if (vregToPhys(vreg)) |phys| {
                 self.emit(a64.str64(phys, REGS_PTR, @as(u16, vreg) * 8));
             }

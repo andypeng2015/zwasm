@@ -37,13 +37,20 @@ Session handover document. Read at session start.
 - Guard page recovery: save/restore across nested JIT calls (SIGBUS fix)
 - instrDefinesRd: global.set/memory.fill/memory.copy rd is USE not DEF
 - computeCalleeSavedLiveSet: added rd-as-USE + select condition vreg
-- Mac: 50/50 PASS, 0 CRASH. Spec 62,263/62,263. E2E 792/792.
+- x86 emitCall: removed liveness-aware spill/reload (caused register file
+  corruption — non-live phys regs had garbage after CALL, subsequent
+  spillCallerSaved wrote garbage to register file)
+- ARM64 spillCallerSavedLive: reverted "spill ALL" back to "spill live only"
+  (the "spill ALL" caused intermittent failures in Go programs)
+- Mac: 50/50* PASS (2 intermittent Go programs — pre-existing on main)
+- Ubuntu: 50/50 PASS, 0 CRASH. Spec 62,263/62,263. E2E 792/792.
 
 **Next**: Merge Gate (Mac + Ubuntu), then merge to main + update compat count.
 
 ## Known Bugs
 
-- None active (W30 resolved).
+- Intermittent ARM64 JIT: go_regex, go_crypto_sha256 sometimes produce
+  empty stdout (pre-existing on main branch, not a regression).
 
 ## References
 
