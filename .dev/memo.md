@@ -23,9 +23,9 @@ Design: `@./.dev/references/allocator-injection-plan.md`.
 
 - [x] **11.2** C API config — `zwasm_config_t` + `set_allocator()` + `new_configured()` (3d4db98)
 - [x] **11.3** Docs — ARCHITECTURE.md allocator flow, `docs/embedding.md` (d5709f5)
-- [ ] **11.1** CW finalizer — add `deinit()` in CW gc.zig sweep for wasm_module (ClojureWasm repo)
+- [x] **11.1** CW finalizer — GC finalizer registry + WasmModule deinit (CW 4a12e1d)
 
-**Next**: 11.1 (CW side). Then Merge Gate → tag v1.5.0.
+**Next**: Merge Gate (Mac + Ubuntu) → merge to main → tag v1.5.0.
 
 ## References
 
