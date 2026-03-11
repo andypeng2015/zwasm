@@ -98,6 +98,7 @@ pub const WasmError = error{
     /// Wasm exception thrown via `throw`/`throw_ref` — not caught by any try_table.
     WasmException,
     FuelExhausted,
+    TimeoutExceeded,
     LabelStackUnderflow,
     OperandStackUnderflow,
     MemoryLimitExceeded,
@@ -108,6 +109,7 @@ const OPERAND_STACK_SIZE = 4096;
 const FRAME_STACK_SIZE = 1024;
 pub const MAX_CALL_DEPTH = 1024; // native recursion limit — must not overflow Zig stack
 const LABEL_STACK_SIZE = 4096;
+const DEADLINE_CHECK_INTERVAL: u32 = 1024;
 
 const Frame = struct {
     locals_start: usize, // index into operand stack where locals begin
@@ -388,6 +390,8 @@ pub const Vm = struct {
     trace: ?*trace_mod.TraceConfig = null,
     max_memory_bytes: ?u64 = null,
     fuel: ?u64 = null,
+    deadline_ns: ?i128 = null,
+    deadline_check_remaining: u32 = DEADLINE_CHECK_INTERVAL,
 
     // Tail call support: when return_call is executed, the callee's func_ptr
     // is stored here and execute() returns normally. doCallDirect() then
@@ -421,6 +425,35 @@ pub const Vm = struct {
         self.pending_exception = null;
         self.exn_store_count = 0;
         self.call_depth = 0;
+        self.deadline_check_remaining = DEADLINE_CHECK_INTERVAL;
+    }
+
+    pub fn setDeadlineTimeoutMs(self: *Vm, timeout_ms: ?u64) void {
+        if (timeout_ms) |value| {
+            if (value == 0) {
+                self.deadline_ns = null;
+            } else {
+                self.deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(value)) * std.time.ns_per_ms;
+            }
+        } else {
+            self.deadline_ns = null;
+        }
+        self.deadline_check_remaining = DEADLINE_CHECK_INTERVAL;
+    }
+
+    inline fn consumeInstructionBudget(self: *Vm) WasmError!void {
+        if (self.fuel) |*f| {
+            if (f.* == 0) return error.FuelExhausted;
+            f.* -= 1;
+        }
+        if (self.deadline_ns) |deadline_ns| {
+            if (self.deadline_check_remaining == 0) {
+                self.deadline_check_remaining = DEADLINE_CHECK_INTERVAL;
+                if (std.time.nanoTimestamp() >= deadline_ns) return error.TimeoutExceeded;
+            } else {
+                self.deadline_check_remaining -= 1;
+            }
+        }
     }
 
     /// Returns true when JIT must be suppressed because fuel metering is active.
@@ -822,10 +855,7 @@ pub const Vm = struct {
             const byte = try reader.readByte();
             const op: Opcode = @enumFromInt(byte);
 
-            if (self.fuel) |*f| {
-                if (f.* == 0) return error.FuelExhausted;
-                f.* -= 1;
-            }
+            try self.consumeInstructionBudget();
 
             if (self.profile) |p| {
                 p.opcode_counts[byte] += 1;
@@ -4464,10 +4494,7 @@ pub const Vm = struct {
             const instr = code[pc];
             pc += 1;
 
-            if (self.fuel) |*f| {
-                if (f.* == 0) return error.FuelExhausted;
-                f.* -= 1;
-            }
+            try self.consumeInstructionBudget();
 
             if (self.profile) |p| {
                 if (instr.op < 256)
@@ -5502,10 +5529,7 @@ pub const Vm = struct {
             const instr = code[pc];
             pc += 1;
 
-            if (self.fuel) |*f| {
-                if (f.* == 0) return error.FuelExhausted;
-                f.* -= 1;
-            }
+            try self.consumeInstructionBudget();
 
             if (self.profile) |p| {
                 if (instr.opcode < 256)
