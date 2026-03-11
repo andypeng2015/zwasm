@@ -142,6 +142,14 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     (cd "$PROJECT_DIR" && zig build -Doptimize=ReleaseSafe)
 fi
 
+if [[ ! -x "$ZWASM" ]]; then
+    echo "ERROR: zwasm binary not found at $ZWASM" >&2
+    echo "Contents of zig-out/bin/:" >&2
+    ls -la "$PROJECT_DIR/zig-out/bin/" >&2 || echo "  (directory not found)" >&2
+    exit 1
+fi
+echo "  Binary: $ZWASM ($(wc -c < "$ZWASM" | tr -d ' ') bytes)"
+
 CURRENT_RESULTS="$TMPDIR_CI/current.txt"
 : > "$CURRENT_RESULTS"
 run_benchmarks "$ZWASM" "$CURRENT_RESULTS" "$PROJECT_DIR"
