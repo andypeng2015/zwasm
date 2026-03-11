@@ -150,6 +150,16 @@ if [[ ! -x "$ZWASM" ]]; then
 fi
 echo "  Binary: $ZWASM ($(wc -c < "$ZWASM" | tr -d ' ') bytes)"
 
+# Smoke test: verify binary can run a simple wasm
+echo "  Smoke test..."
+if ! "$ZWASM" run --invoke fib "$PROJECT_DIR/src/testdata/02_fibonacci.wasm" 10 2>&1; then
+    echo "ERROR: zwasm smoke test failed" >&2
+    file "$ZWASM" >&2
+    "$ZWASM" run --invoke fib "$PROJECT_DIR/src/testdata/02_fibonacci.wasm" 10 2>&1 || true
+    exit 1
+fi
+echo "  Smoke test passed."
+
 CURRENT_RESULTS="$TMPDIR_CI/current.txt"
 : > "$CURRENT_RESULTS"
 run_benchmarks "$ZWASM" "$CURRENT_RESULTS" "$PROJECT_DIR"
