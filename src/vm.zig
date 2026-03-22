@@ -395,6 +395,10 @@ pub const Vm = struct {
     /// Force stack-based interpreter for all functions, bypassing RegIR and JIT.
     /// Used by differential testing to get a "reference" result.
     force_interpreter: bool = false,
+    /// JIT-accessible fuel counter. Signed so JIT can check < 0 with a single
+    /// branch after decrement. Synced from/to `fuel` before/after JIT execution.
+    /// maxInt = unlimited (JIT skips the check entirely when this value is seen).
+    jit_fuel: i64 = std.math.maxInt(i64),
 
     // Tail call support: when return_call is executed, the callee's func_ptr
     // is stored here and execute() returns normally. doCallDirect() then
@@ -459,11 +463,11 @@ pub const Vm = struct {
         }
     }
 
-    /// Returns true when JIT must be suppressed because fuel or deadline is active.
-    /// JIT-compiled native code does not call consumeInstructionBudget(),
-    /// so we fall back to the interpreter to honour resource limits.
+    /// Returns true when JIT must be suppressed because deadline is active.
+    /// Fuel is now handled by JIT back-edge checks (jit_fuel counter),
+    /// so only deadline still requires interpreter fallback.
     pub inline fn jitSuppressed(self: *const Vm) bool {
-        return self.fuel != null or self.deadline_ns != null;
+        return self.deadline_ns != null;
     }
 
     /// Store an exception and return its exnref value (index + 1).
@@ -4275,8 +4279,18 @@ pub const Vm = struct {
             });
         }
 
+        // Sync fuel to JIT counter before entry
+        if (self.fuel) |f| {
+            self.jit_fuel = @intCast(f);
+        }
+
         // Call OSR entry: sets up callee-saved, memory cache, then jumps to loop body
         const err_code = osr_fn(regs_ptr, @ptrCast(self), @ptrCast(instance));
+
+        // Sync JIT counter back to fuel after exit
+        if (self.fuel != null) {
+            self.fuel = if (self.jit_fuel >= 0) @intCast(self.jit_fuel) else 0;
+        }
 
         // Restore caller's recovery context
         guard_mod.setRecovery(saved_recovery);
@@ -4291,6 +4305,7 @@ pub const Vm = struct {
                 6 => error.OutOfBoundsMemoryAccess,
                 7 => error.WasmException,
                 8 => error.InvalidConversion,
+                9 => error.FuelExhausted,
                 else => error.Trap,
             };
         }
@@ -4337,8 +4352,18 @@ pub const Vm = struct {
             });
         }
 
+        // Sync fuel to JIT counter before entry
+        if (self.fuel) |f| {
+            self.jit_fuel = @intCast(f);
+        }
+
         // Call JIT-compiled function
         const err_code = jc.entry(regs.ptr, @ptrCast(self), @ptrCast(instance));
+
+        // Sync JIT counter back to fuel after exit
+        if (self.fuel != null) {
+            self.fuel = if (self.jit_fuel >= 0) @intCast(self.jit_fuel) else 0;
+        }
 
         // Restore caller's recovery context (not just clear)
         guard_mod.setRecovery(saved_recovery);
@@ -4353,6 +4378,7 @@ pub const Vm = struct {
                 6 => error.OutOfBoundsMemoryAccess,
                 7 => error.WasmException,
                 8 => error.InvalidConversion,
+                9 => error.FuelExhausted,
                 else => error.Trap,
             };
         }
