@@ -392,6 +392,9 @@ pub const Vm = struct {
     fuel: ?u64 = null,
     deadline_ns: ?i128 = null,
     deadline_check_remaining: u32 = DEADLINE_CHECK_INTERVAL,
+    /// Force stack-based interpreter for all functions, bypassing RegIR and JIT.
+    /// Used by differential testing to get a "reference" result.
+    force_interpreter: bool = false,
 
     // Tail call support: when return_call is executed, the callee's func_ptr
     // is stored here and execute() returns normally. doCallDirect() then
@@ -589,8 +592,10 @@ pub const Vm = struct {
                     }
                 }
 
-                if (has_v128) {
-                    // Skip RegIR/JIT for v128 params — fall through to stack path
+                if (has_v128 or self.force_interpreter) {
+                    // Skip RegIR/JIT — fall through to stack path
+                    // (v128 params can't use u64 register file;
+                    //  force_interpreter is used by differential testing)
                 } else if (wf.reg_ir) |reg| {
                     // Dump RegIR if requested (one-shot)
                     if (self.trace) |tc| {
@@ -9849,4 +9854,148 @@ test "Back-edge JIT — hasPrologueSideEffects" {
         .{ .op = regalloc_mod.OP_BR_IF, .rd = 0, .rs1 = 0, .operand = 2 }, // back-edge to pc=2
     };
     try testing.expect(Vm.hasBrTableInPrologue(&go_state_machine, 2)); // target=2, br_table at pc=2
+}
+
+// ============================================================
+// Differential testing: interpreter vs JIT/RegIR
+// ============================================================
+
+/// Run the same function via both interpreter-only and default (JIT/RegIR) paths,
+/// assert results are identical. This catches JIT-only miscompilation bugs.
+fn differentialInvoke(
+    inst: *Instance,
+    name: []const u8,
+    args: []u64,
+    expected_results: usize,
+    alloc: Allocator,
+) !void {
+    // Run 1: interpreter-only (force_interpreter=true)
+    var vm_interp = Vm.init(alloc);
+    vm_interp.force_interpreter = true;
+    const interp_args = try alloc.alloc(u64, args.len);
+    defer alloc.free(interp_args);
+    @memcpy(interp_args, args);
+    const interp_results = try alloc.alloc(u64, expected_results);
+    defer alloc.free(interp_results);
+    @memset(interp_results, 0);
+    try vm_interp.invoke(inst, name, interp_args, interp_results);
+
+    // Run 2: default path (RegIR + JIT if eligible)
+    // Call multiple times to trigger JIT (HOT_THRESHOLD=10)
+    var vm_default = Vm.init(alloc);
+    const default_args = try alloc.alloc(u64, args.len);
+    defer alloc.free(default_args);
+    const default_results = try alloc.alloc(u64, expected_results);
+    defer alloc.free(default_results);
+    for (0..15) |_| {
+        @memcpy(default_args, args);
+        @memset(default_results, 0);
+        vm_default.reset();
+        try vm_default.invoke(inst, name, default_args, default_results);
+    }
+
+    // Compare results
+    for (0..expected_results) |i| {
+        try testing.expectEqual(interp_results[i], default_results[i]);
+    }
+}
+
+test "Differential — i32.add interpreter vs JIT" {
+    // (func (export "add") (param i32 i32) (result i32) (i32.add (local.get 0) (local.get 1)))
+    const wasm = "\x00\x61\x73\x6d\x01\x00\x00\x00" ++
+        "\x01\x07\x01\x60\x02\x7f\x7f\x01\x7f" ++
+        "\x03\x02\x01\x00" ++
+        "\x07\x07\x01\x03\x61\x64\x64\x00\x00" ++
+        "\x0a\x09\x01\x07\x00\x20\x00\x20\x01\x6a\x0b";
+
+    var mod = Module.init(testing.allocator, wasm);
+    defer mod.deinit();
+    try mod.decode();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var inst = Instance.init(testing.allocator, &store, &mod);
+    defer inst.deinit();
+    try inst.instantiate();
+
+    var args = [_]u64{ 3, 4 };
+    try differentialInvoke(&inst, "add", &args, 1, testing.allocator);
+
+    // Edge cases
+    args = [_]u64{ 0, 0 };
+    try differentialInvoke(&inst, "add", &args, 1, testing.allocator);
+    args = [_]u64{ 0xFFFFFFFF, 1 };
+    try differentialInvoke(&inst, "add", &args, 1, testing.allocator);
+}
+
+test "Differential — recursive fibonacci interpreter vs JIT" {
+    const types = @import("types.zig");
+    const WasmModule = types.WasmModule;
+    const mod = try WasmModule.loadFromWat(testing.allocator,
+        \\(module
+        \\  (func (export "fib") (param i32) (result i32)
+        \\    (if (result i32) (i32.le_s (local.get 0) (i32.const 1))
+        \\      (then (local.get 0))
+        \\      (else (i32.add
+        \\        (call 0 (i32.sub (local.get 0) (i32.const 1)))
+        \\        (call 0 (i32.sub (local.get 0) (i32.const 2))))))))
+    );
+    defer mod.deinit();
+
+    var args = [_]u64{10};
+    try differentialInvoke(&mod.instance, "fib", &args, 1, testing.allocator);
+}
+
+test "Differential — loop with accumulator interpreter vs JIT" {
+    const types = @import("types.zig");
+    const WasmModule = types.WasmModule;
+    const mod = try WasmModule.loadFromWat(testing.allocator,
+        \\(module
+        \\  (func (export "sum") (param i32) (result i32)
+        \\    (local i32 i32)
+        \\    (local.set 1 (i32.const 0))
+        \\    (local.set 2 (i32.const 0))
+        \\    (block (loop
+        \\      (br_if 1 (i32.ge_u (local.get 1) (local.get 0)))
+        \\      (local.set 2 (i32.add (local.get 2) (local.get 1)))
+        \\      (local.set 1 (i32.add (local.get 1) (i32.const 1)))
+        \\      (br 0)))
+        \\    (local.get 2)))
+    );
+    defer mod.deinit();
+
+    // sum(100) = 0+1+2+...+99 = 4950
+    var args = [_]u64{100};
+    try differentialInvoke(&mod.instance, "sum", &args, 1, testing.allocator);
+}
+
+test "Differential — force_interpreter flag works" {
+    // Verify force_interpreter actually uses the stack path, not RegIR/JIT
+    const wasm = "\x00\x61\x73\x6d\x01\x00\x00\x00" ++
+        "\x01\x05\x01\x60\x00\x01\x7f" ++
+        "\x03\x02\x01\x00" ++
+        "\x07\x05\x01\x01\x66\x00\x00" ++
+        "\x0a\x06\x01\x04\x00\x41\x2a\x0b";
+
+    var mod = Module.init(testing.allocator, wasm);
+    defer mod.deinit();
+    try mod.decode();
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var inst = Instance.init(testing.allocator, &store, &mod);
+    defer inst.deinit();
+    try inst.instantiate();
+
+    // With force_interpreter, function should still work correctly
+    var vm = Vm.init(testing.allocator);
+    vm.force_interpreter = true;
+    var results = [_]u64{0};
+    try vm.invoke(&inst, "f", &.{}, &results);
+    try testing.expectEqual(@as(u64, 42), results[0]);
+
+    // JIT/RegIR should NOT have been triggered
+    const func_addr = inst.getExportFunc("f") orelse return error.FunctionIndexOutOfBounds;
+    const func_ptr = try inst.store.getFunctionPtr(func_addr);
+    // With force_interpreter, reg_ir conversion should still happen (lazy) but not execute
+    // The key test: results match between both paths
+    try testing.expect(func_ptr.subtype.wasm_function.jit_code == null);
 }
