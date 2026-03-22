@@ -9954,6 +9954,7 @@ test "Differential — i32.add interpreter vs JIT" {
 }
 
 test "Differential — recursive fibonacci interpreter vs JIT" {
+    if (!build_options.enable_wat) return error.SkipZigTest;
     const types = @import("types.zig");
     const WasmModule = types.WasmModule;
     const mod = try WasmModule.loadFromWat(testing.allocator,
@@ -9972,6 +9973,7 @@ test "Differential — recursive fibonacci interpreter vs JIT" {
 }
 
 test "Differential — loop with accumulator interpreter vs JIT" {
+    if (!build_options.enable_wat) return error.SkipZigTest;
     const types = @import("types.zig");
     const WasmModule = types.WasmModule;
     const mod = try WasmModule.loadFromWat(testing.allocator,
