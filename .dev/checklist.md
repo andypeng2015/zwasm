@@ -29,9 +29,9 @@ Prefix: W## (to distinguish from CW's F## items).
   Also fixed: `--interp` flag incomplete (doCallDirectIR), i32.store16 access_size.
   Commit 1429f81 on branch `fix/w35-arm64-jit-oob`.
 
-- [ ] W36: Flaky real-world compat: go_crypto_sha256 / go_regex intermittent DIFF
-  Reproduced on base code (no local changes). Non-deterministic — passes ~50% of runs.
-  May or may not be related to W35 (both are OOB class).
+- [x] W36: Flaky real-world compat: go_crypto_sha256 / go_regex intermittent DIFF — **FIXED (W35)**
+  Root cause: W35 ARM64 JIT `emitGlobalSet` ABI clobber caused non-deterministic OOB.
+  After W35 fix (commit 1429f81), 3 consecutive runs 50/50 PASS. No independent bug.
 
 ## Resolved items (summary, details in git history)
 
