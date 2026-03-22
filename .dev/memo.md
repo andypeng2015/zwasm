@@ -18,8 +18,15 @@ Session handover document. Read at session start.
 
 ### Status
 
-- Research complete (2026-03-22). Documents committed.
-- Next: Step 13.0 (Float register class + infrastructure)
+- **13.0 DONE**: simdStackEffect table, simd_arm64/x86.zig stubs
+- **13.1 DONE**: All 252 SIMD opcodes flow through RegIR via stack adapter
+  - v128 storage: lo in regs[rd], hi in simd_hi[rd] (stack-local [512]u64)
+  - OP_MOV/CONST now copy/clear simd_hi (bug: upper 64-bit loss, fixed)
+  - Spec: 62,263/62,263. SIMD conformance: 3/3. Real-world samples: 6/6 correct.
+- **5 real-world SIMD C samples** in test/realworld/c_simd/ (wasi-sdk -msimd128)
+- **Next**: Step 13.2+ (JIT codegen for SIMD opcodes — ARM64 NEON + x86 SSE)
+- SIMD bench baseline recorded (adapter is 20-53x slower than scalar — expected,
+  adapter marshals via op_stack; JIT will eliminate this overhead)
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
 ### Key Design (D130)
