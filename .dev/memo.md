@@ -14,7 +14,21 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-**Phase 13: SIMD JIT** — Next major phase on roadmap.
+**Phase 13: SIMD JIT** — Branch `phase13/simd-jit`. Decision D130.
+
+### Status
+
+- Research complete (2026-03-22). Documents committed.
+- Next: Step 13.0 (Float register class + infrastructure)
+- See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
+
+### Key Design (D130)
+
+- Float register class (GP + Float, industry standard)
+- ARM64 + x86 per opcode group (no big-bang porting)
+- SSE4.1 minimum, tbl/pshufb shuffle fallback
+- Full opcode coverage needed for real-world benefit (SIMD in large mixed functions)
+- `-Dsimd=false` excludes codegen via comptime
 
 ### Remaining Workarounds
 
@@ -30,8 +44,10 @@ Session handover document. Read at session start.
 
 ## References
 
-- `@./.dev/roadmap.md` — Phase 13 SIMD JIT plan
+- `@./.dev/roadmap.md` — Phase 13 SIMD JIT plan (13.0-13.8)
+- `@./.dev/references/simd-jit-research.md` — SIMD JIT research
+- `@./.dev/decisions.md` — D130 SIMD JIT architecture
+- `@./.claude/rules/simd-jit.md` — auto-loaded rules for SIMD work
 - `@./.dev/checklist.md` — open items
 - `@./.dev/jit-debugging.md` — JIT debug techniques
-- `@./.dev/decisions.md`, `@./.dev/spec-support.md`
 - External: wasmtime (`~/Documents/OSS/wasmtime/`), zware (`~/Documents/OSS/zware/`)
