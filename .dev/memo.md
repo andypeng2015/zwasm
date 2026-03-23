@@ -14,24 +14,19 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-**Doc overhaul & production readiness** — Branch `cleanup/doc-overhaul`.
+**Performance & reliability** — Branch `perf/epoch-jit-timeout`.
 
-Transition from "active feature development" to "stable, fast, spec-tracking" posture.
-All major features complete. Focus shifts to:
-- Documentation accuracy and completeness
-- Long-term maintenance strategy (spec tracking, Zig upgrades)
-- Performance: W37 (contiguous v128), W38 (compiler patterns)
-- Remaining work: Phase 18 (Lazy Compilation, CLI Extensions)
+W40 + W37 complete. JIT now coexists with deadline timeouts (D131) and uses
+contiguous v128 storage for single-instruction SIMD load/store. Next: W39.
 
 ### Open Work Items
 
-| Item          | Description                                        |
-|---------------|----------------------------------------------------|
-| W37           | Contiguous v128 storage (SIMD perf)                |
-| W38           | Compiler-generated SIMD patterns                   |
-| Phase 18      | Lazy Compilation + CLI Extensions                  |
-| PR #6         | Timeout support (fuel bypass fixed)                |
-| jitSuppressed | Epoch-based check (replaces deadline suppression)  |
+| Item     | Description                            |
+|----------|----------------------------------------|
+| ~~W37~~  | Contiguous v128 storage (DONE)          |
+| W38      | Compiler-generated SIMD patterns       |
+| W39      | Multi-value return JIT                 |
+| Phase 18 | Lazy Compilation + CLI Extensions      |
 
 ## Completed Phases (summary)
 

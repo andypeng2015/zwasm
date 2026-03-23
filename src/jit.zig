@@ -768,6 +768,18 @@ const a64 = struct {
         return 0xFD000000 | (@as(u32, imm12) << 10) | (@as(u32, xn) << 5) | dt;
     }
 
+    /// LDR Qt, [Xn, #imm] — load 128-bit FP/SIMD, unsigned offset (imm_bytes / 16)
+    fn ldrFp128(qt: u5, xn: u5, imm_bytes: u16) u32 {
+        const imm12: u12 = @intCast(imm_bytes / 16);
+        return 0x3DC00000 | (@as(u32, imm12) << 10) | (@as(u32, xn) << 5) | qt;
+    }
+
+    /// STR Qt, [Xn, #imm] — store 128-bit FP/SIMD, unsigned offset (imm_bytes / 16)
+    fn strFp128(qt: u5, xn: u5, imm_bytes: u16) u32 {
+        const imm12: u12 = @intCast(imm_bytes / 16);
+        return 0x3D800000 | (@as(u32, imm12) << 10) | (@as(u32, xn) << 5) | qt;
+    }
+
     /// MOV Vd.16B, Vn.16B — copy 128-bit vector (alias for ORR Vd, Vn, Vn)
     fn movV16b(vd: u5, vn: u5) u32 {
         return orrV16b(vd, vn, vn);
@@ -1020,6 +1032,7 @@ pub const Compiler = struct {
     mem_copy_addr: u64,
     call_indirect_addr: u64,
     gc_trampoline_addr: u64,
+    fuel_check_helper_addr: u64,
     pool64: []const u64,
     has_memory: bool,
     has_self_call: bool,
@@ -1038,7 +1051,7 @@ pub const Compiler = struct {
     result_count: u16,
     reg_ptr_offset: u32,
     jit_fuel_offset: u32,
-    simd_hi_offset: u32,
+    simd_v128_offset: u32,
     min_memory_bytes: u32,
     /// Bitmask of vregs that need loading in the prologue.
     /// Bit N = 1 means vreg N is read before written and must be loaded.
@@ -1129,6 +1142,7 @@ pub const Compiler = struct {
             .mem_copy_addr = 0,
             .call_indirect_addr = 0,
             .gc_trampoline_addr = 0,
+            .fuel_check_helper_addr = 0,
             .pool64 = &.{},
             .has_memory = false,
             .has_self_call = false,
@@ -1141,7 +1155,7 @@ pub const Compiler = struct {
             .result_count = 0,
             .reg_ptr_offset = 0,
             .jit_fuel_offset = 0,
-            .simd_hi_offset = 0,
+            .simd_v128_offset = 0,
             .min_memory_bytes = 0,
             .prologue_load_mask = 0xFFFFF, // default: load all (20 vregs)
             .known_consts = .{null} ** 128,
@@ -1568,7 +1582,7 @@ pub const Compiler = struct {
         return switch (op) {
             regalloc_mod.OP_NOP, regalloc_mod.OP_DELETED, regalloc_mod.OP_BLOCK_END,
             regalloc_mod.OP_BR, regalloc_mod.OP_BR_IF, regalloc_mod.OP_BR_IF_NOT,
-            regalloc_mod.OP_RETURN, regalloc_mod.OP_RETURN_VOID, regalloc_mod.OP_BR_TABLE,
+            regalloc_mod.OP_RETURN, regalloc_mod.OP_RETURN_MULTI, regalloc_mod.OP_RETURN_VOID, regalloc_mod.OP_BR_TABLE,
             => false,
             // Memory stores use rd as VALUE source, not a definition
             0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
@@ -2120,6 +2134,39 @@ pub const Compiler = struct {
         self.emit(a64.ret_());
     }
 
+    /// Multi-value return epilogue: stores N result vregs to regs[0..n-1].
+    fn emitEpilogueMulti(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) void {
+        const count: u32 = instr.operand;
+        // Store first two results from instr.rd and instr.rs1
+        self.emitStoreResultVreg(0, instr.rd);
+        if (count > 1) self.emitStoreResultVreg(1, instr.rs1);
+        // Additional results from following NOP instructions
+        var ri: u32 = 2;
+        while (ri < count and pc.* < ir.len) {
+            const nop = ir[pc.*];
+            pc.* += 1;
+            self.emitStoreResultVreg(ri, nop.rd);
+            ri += 1;
+            if (ri < count) {
+                self.emitStoreResultVreg(ri, nop.rs1);
+                ri += 1;
+            }
+        }
+        self.emitCalleeSavedRestore();
+        self.emit(a64.movz64(0, 0, 0));
+        self.emit(a64.ret_());
+    }
+
+    /// Store vreg value to regs[result_idx] for multi-value return.
+    fn emitStoreResultVreg(self: *Compiler, result_idx: u32, vreg: u16) void {
+        if (vregToPhys(vreg)) |phys| {
+            self.emit(a64.str64(phys, REGS_PTR, @intCast(result_idx * 8)));
+        } else {
+            self.emit(a64.ldr64(SCRATCH, REGS_PTR, @as(u16, vreg) * 8));
+            self.emit(a64.str64(SCRATCH, REGS_PTR, @intCast(result_idx * 8)));
+        }
+    }
+
     fn emitErrorReturn(self: *Compiler, error_code: u16) void {
         self.emitCalleeSavedRestore();
         self.emit(a64.movz64(0, error_code, 0));
@@ -2295,6 +2342,7 @@ pub const Compiler = struct {
             regalloc_mod.OP_CALL,
             regalloc_mod.OP_CALL_INDIRECT,
             regalloc_mod.OP_RETURN,
+            regalloc_mod.OP_RETURN_MULTI,
             regalloc_mod.OP_RETURN_VOID,
             => true,
             else => false,
@@ -2548,6 +2596,10 @@ pub const Compiler = struct {
             regalloc_mod.OP_RETURN => {
                 self.fpCacheEvictAll();
                 self.emitEpilogue(instr.rd);
+            },
+            regalloc_mod.OP_RETURN_MULTI => {
+                self.fpCacheEvictAll();
+                self.emitEpilogueMulti(instr, ir, pc);
             },
             regalloc_mod.OP_RETURN_VOID => {
                 self.fpCacheEvictAll();
@@ -3448,8 +3500,9 @@ pub const Compiler = struct {
     }
 
     /// Emit fuel check at a loop back-edge.
-    /// Decrements jit_fuel in the VM struct; if negative, branches to a shared
-    /// fuel-exhausted exit (emitted once at end of function by emitErrorStubs).
+    /// Decrements jit_fuel in the VM struct; if negative, calls a shared
+    /// fuel-check stub via BL. The stub calls jitFuelCheckHelper which either
+    /// re-arms the counter (returns to continue) or exits JIT with an error.
     fn emitFuelCheck(self: *Compiler) void {
         // Skip when offset is 0 (unit tests without Vm struct)
         if (self.jit_fuel_offset == 0) return;
@@ -3475,10 +3528,19 @@ pub const Compiler = struct {
         self.emit(a64.subsImm64(fuel_reg, fuel_reg, 1));
         self.emit(a64.str64(fuel_reg, SCRATCH, 0));
         self.scratch_vreg = null;
-        // Branch to shared fuel exit (patched in emitErrorStubs)
-        const branch_idx = self.currentIdx();
-        self.emit(a64.bCond(.mi, 0)); // placeholder
-        self.fuel_check_branches.append(self.alloc, branch_idx) catch {};
+        // Fast path: fuel >= 0, skip the slow path
+        const skip_idx = self.currentIdx();
+        self.emit(a64.bCond(.pl, 0)); // placeholder: B.PL .skip
+        // Slow path: BL to shared fuel check stub (patched in emitErrorStubs).
+        // BL sets x30 = return address (= .skip), so the stub can RET to continue.
+        const bl_idx = self.currentIdx();
+        self.emit(0x94000000); // BL placeholder
+        // .skip: — fast-path and stub-return land here
+        // Patch B.PL to jump here
+        const skip_offset: i32 = @as(i32, @intCast(self.currentIdx())) - @as(i32, @intCast(skip_idx));
+        const skip_imm: u19 = @bitCast(@as(i19, @intCast(skip_offset)));
+        self.code.items[skip_idx] = 0x54000000 | (@as(u32, skip_imm) << 5) | @as(u32, @intFromEnum(a64.Cond.pl));
+        self.fuel_check_branches.append(self.alloc, bl_idx) catch {};
     }
 
     /// Emit conditional error: if condition is true, branch to shared error stub.
@@ -4119,48 +4181,35 @@ pub const Compiler = struct {
     const SIMD_SCRATCH0: u5 = 0; // V0/Q0
     const SIMD_SCRATCH1: u5 = 1; // V1/Q1
 
-    /// Load v128 from regs[vreg] + simd_hi[vreg] into NEON Q register.
-    /// Uses SCRATCH (x8) as temp. 3 instructions.
-    fn emitLoadV128(self: *Compiler, qd: u5, vreg: u16) void {
-        const vreg_offset: u16 = vreg * 8;
-        // Step 1: LDR Dd, [REGS_PTR, #vreg*8] — load lower 64 bits into D register
-        //         (upper 64 bits of Qd are zeroed by LDR D)
-        self.emit(a64.ldrFp64(qd, REGS_PTR, vreg_offset));
-        // Step 2: LDR X8, [VM_PTR, #simd_hi_offset + vreg*8] — load upper 64 bits to GP
+    /// Compute the base address of simd_v128[vreg] into SCRATCH.
+    /// simd_v128 is [512][2]u64 align(16), so each entry is 16 bytes.
+    fn emitSimdV128Addr(self: *Compiler, vreg: u16) void {
         self.emitLoadVmPtr(SCRATCH);
-        const hi_offset = self.simd_hi_offset + @as(u32, vreg) * 8;
-        if (hi_offset <= 32760) {
-            self.emit(a64.ldr64(SCRATCH, SCRATCH, @intCast(hi_offset)));
+        const byte_offset = self.simd_v128_offset + @as(u32, vreg) * 16;
+        if (byte_offset <= 4095) {
+            self.emit(a64.addImm64(SCRATCH, SCRATCH, @intCast(byte_offset)));
         } else {
-            // Large offset: use SCRATCH2 for address
-            const hi_instrs = a64.loadImm64(SCRATCH2, hi_offset);
-            for (hi_instrs) |inst| self.emit(inst);
+            const offset_instrs = a64.loadImm64(SCRATCH2, byte_offset);
+            for (offset_instrs) |inst| self.emit(inst);
             self.emit(a64.add64(SCRATCH, SCRATCH, SCRATCH2));
-            self.emit(a64.ldr64(SCRATCH, SCRATCH, 0));
         }
-        // Step 3: INS Vd.D[1], X8 — insert upper half
-        self.emit(a64.insVdD1(qd, SCRATCH));
     }
 
-    /// Store NEON Q register to regs[vreg] + simd_hi[vreg].
-    /// Uses SCRATCH (x8) as temp. 3 instructions.
+    /// Load v128 from simd_v128[vreg] into NEON Q register (contiguous 128-bit).
+    fn emitLoadV128(self: *Compiler, qd: u5, vreg: u16) void {
+        self.emitSimdV128Addr(vreg);
+        // LDR Q, [SCRATCH] — single 128-bit load
+        self.emit(a64.ldrFp128(qd, SCRATCH, 0));
+    }
+
+    /// Store NEON Q register to simd_v128[vreg] (contiguous 128-bit).
+    /// Also writes lo half to regs[vreg] for trampoline/interpreter compatibility.
     fn emitStoreV128(self: *Compiler, qs: u5, vreg: u16) void {
-        const vreg_offset: u16 = vreg * 8;
-        // Step 1: STR Ds, [REGS_PTR, #vreg*8] — store lower 64 bits from D register
-        self.emit(a64.strFp64(qs, REGS_PTR, vreg_offset));
-        // Step 2: UMOV X8, Vs.D[1] — extract upper 64 bits to GP
-        self.emit(a64.umovXdD1(SCRATCH, qs));
-        // Step 3: STR X8, [VM_PTR, #simd_hi_offset + vreg*8] — store upper 64 bits
-        self.emitLoadVmPtr(SCRATCH2);
-        const hi_offset = self.simd_hi_offset + @as(u32, vreg) * 8;
-        if (hi_offset <= 32760) {
-            self.emit(a64.str64(SCRATCH, SCRATCH2, @intCast(hi_offset)));
-        } else {
-            const hi_instrs = a64.loadImm64(17, hi_offset); // use x17 as temp
-            for (hi_instrs) |inst| self.emit(inst);
-            self.emit(a64.add64(SCRATCH2, SCRATCH2, 17));
-            self.emit(a64.str64(SCRATCH, SCRATCH2, 0));
-        }
+        self.emitSimdV128Addr(vreg);
+        // STR Q, [SCRATCH] — single 128-bit store
+        self.emit(a64.strFp128(qs, SCRATCH, 0));
+        // Also store lo half to regs[vreg] for cross-tier compatibility
+        self.emit(a64.strFp64(qs, REGS_PTR, @as(u16, vreg) * 8));
     }
 
     /// Emit native NEON instruction for a binary v128 op.
@@ -5426,21 +5475,10 @@ pub const Compiler = struct {
                 self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
                 self.emitCondError(.hi, 6);
                 self.emit(a64.ldr32Reg(SCRATCH, MEM_BASE, SCRATCH));
-                // Store as GP vreg (lo = value, hi = 0)
-                const d = destReg(instr.rd);
-                self.emit(a64.mov32(d, SCRATCH));
-                self.storeVreg(instr.rd, d);
-                // Zero simd_hi
-                self.emitLoadVmPtr(SCRATCH2);
-                const hi_offset = self.simd_hi_offset + @as(u32, instr.rd) * 8;
-                if (hi_offset <= 32760) {
-                    self.emit(a64.str64(31, SCRATCH2, @intCast(hi_offset))); // XZR
-                } else {
-                    const off_instrs = a64.loadImm64(SCRATCH, hi_offset);
-                    for (off_instrs) |inst| self.emit(inst);
-                    self.emit(a64.add64(SCRATCH2, SCRATCH2, SCRATCH));
-                    self.emit(a64.str64(31, SCRATCH2, 0));
-                }
+                // Store as v128 with hi=0: use FMOV to move GP→FP, then store
+                // FMOV Dd, Xn — move GP to lo half of Q (hi zeroed)
+                self.emit(a64.fmovToFp64(SIMD_SCRATCH0, SCRATCH));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
                 return true;
             },
             0x5D => { // v128.load64_zero: load 8 bytes into lane 0, zero rest
@@ -5452,21 +5490,9 @@ pub const Compiler = struct {
                 self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
                 self.emitCondError(.hi, 6);
                 self.emit(a64.ldr64Reg(SCRATCH, MEM_BASE, SCRATCH));
-                // Store as GP vreg (lo = value, hi = 0)
-                const d = destReg(instr.rd);
-                self.emit(a64.mov64(d, SCRATCH));
-                self.storeVreg(instr.rd, d);
-                // Zero simd_hi
-                self.emitLoadVmPtr(SCRATCH2);
-                const hi_offset = self.simd_hi_offset + @as(u32, instr.rd) * 8;
-                if (hi_offset <= 32760) {
-                    self.emit(a64.str64(31, SCRATCH2, @intCast(hi_offset)));
-                } else {
-                    const off_instrs = a64.loadImm64(SCRATCH, hi_offset);
-                    for (off_instrs) |inst| self.emit(inst);
-                    self.emit(a64.add64(SCRATCH2, SCRATCH2, SCRATCH));
-                    self.emit(a64.str64(31, SCRATCH2, 0));
-                }
+                // Store as v128 with hi=0
+                self.emit(a64.fmovToFp64(SIMD_SCRATCH0, SCRATCH));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
                 return true;
             },
 
@@ -5686,24 +5712,19 @@ pub const Compiler = struct {
                 if (pool_idx + 1 < self.pool64.len) {
                     const lo = self.pool64[pool_idx];
                     const hi = self.pool64[pool_idx + 1];
-                    // Store lo to regs[rd], hi to simd_hi[rd]
-                    const d = destReg(instr.rd);
-                    const lo_instrs = a64.loadImm64(d, lo);
+                    // Load lo into SCRATCH, hi into SCRATCH2
+                    const lo_instrs = a64.loadImm64(SCRATCH, lo);
                     for (lo_instrs) |inst| self.emit(inst);
-                    self.storeVreg(instr.rd, d);
-                    // Store hi to simd_hi[rd]
-                    const hi_instrs = a64.loadImm64(SCRATCH, hi);
-                    for (hi_instrs) |inst| self.emit(inst);
-                    self.emitLoadVmPtr(SCRATCH2);
-                    const hi_offset = self.simd_hi_offset + @as(u32, instr.rd) * 8;
-                    if (hi_offset <= 32760) {
-                        self.emit(a64.str64(SCRATCH, SCRATCH2, @intCast(hi_offset)));
-                    } else {
-                        const off_instrs = a64.loadImm64(17, hi_offset);
-                        for (off_instrs) |inst| self.emit(inst);
-                        self.emit(a64.add64(SCRATCH2, SCRATCH2, 17));
-                        self.emit(a64.str64(SCRATCH, SCRATCH2, 0));
+                    // FMOV Dd, Xn — lo into D register (hi zeroed)
+                    self.emit(a64.fmovToFp64(SIMD_SCRATCH0, SCRATCH));
+                    if (hi != 0) {
+                        const hi_instrs = a64.loadImm64(SCRATCH, hi);
+                        for (hi_instrs) |inst| self.emit(inst);
+                        // INS Vd.D[1], Xn — insert hi half
+                        self.emit(a64.insVdD1(SIMD_SCRATCH0, SCRATCH));
                     }
+                    // Store contiguous v128 + lo to regs
+                    self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
                     return true;
                 }
                 return false;
@@ -6548,19 +6569,74 @@ pub const Compiler = struct {
             }
         }
 
-        // Emit shared fuel-exhausted exit and patch all fuel check branches.
-        // Single stub: MOVZ x0, #9 + B shared_exit. All back-edge checks branch here.
+        // Emit shared fuel-check stub: called via BL from back-edge fuel checks.
+        // Spills caller-saved vregs, calls jitFuelCheckHelper, and either
+        // RET (continue) or B shared_exit (error).
         if (self.fuel_check_branches.items.len > 0) {
             const fuel_stub_idx = self.currentIdx();
-            self.emit(a64.movz64(0, 9, 0)); // x0 = 9 (FuelExhausted)
-            const exit_offset: i26 = @intCast(@as(i32, @intCast(shared_exit)) - @as(i32, @intCast(self.currentIdx())));
-            self.emit(a64.b(exit_offset));
 
-            // Patch all fuel check B.MI branches to point to this stub
-            for (self.fuel_check_branches.items) |branch_idx| {
-                const offset: i32 = @as(i32, @intCast(fuel_stub_idx)) - @as(i32, @intCast(branch_idx));
-                const imm: u19 = @bitCast(@as(i19, @intCast(offset)));
-                self.code.items[branch_idx] = 0x54000000 | (@as(u32, imm) << 5) | @as(u32, @intFromEnum(a64.Cond.mi));
+            // Save x30 (return address from BL) on stack
+            self.emit(a64.stpPre(29, 30, 31, -2)); // STP x29, x30, [sp, #-16]!
+
+            // Spill caller-saved vregs to memory (x2-x7 = r14-r19, x9-x15 = r5-r11)
+            const max: u8 = @intCast(@min(self.reg_count, MAX_PHYS_REGS));
+            if (max > 5) {
+                for (5..max) |i| {
+                    const vreg: u16 = @intCast(i);
+                    if (vreg == 12 or vreg == 13) continue; // callee-saved
+                    if (vregToPhys(vreg)) |phys| {
+                        self.emit(a64.str64(phys, REGS_PTR, @as(u16, vreg) * 8));
+                    }
+                }
+            }
+
+            // Call jitFuelCheckHelper(vm_ptr)
+            self.emitLoadVmPtr(0); // x0 = vm_ptr (first arg)
+            const addr = self.fuel_check_helper_addr;
+            self.emit(a64.movz64(SCRATCH, @truncate(addr), 0));
+            self.emit(a64.movk64(SCRATCH, @truncate(addr >> 16), 1));
+            self.emit(a64.movk64(SCRATCH, @truncate(addr >> 32), 2));
+            self.emit(a64.movk64(SCRATCH, @truncate(addr >> 48), 3));
+            self.emit(a64.blr(SCRATCH)); // BLR x8
+
+            // Check result: 0 = continue, nonzero = error code
+            const exit_branch_idx = self.currentIdx();
+            self.emit(a64.cbnz64(0, 0)); // placeholder: CBNZ x0, .exit_error
+
+            // Reload caller-saved vregs from memory
+            if (max > 5) {
+                for (5..max) |i| {
+                    const vreg: u16 = @intCast(i);
+                    if (vreg == 12 or vreg == 13) continue;
+                    if (vregToPhys(vreg)) |phys| {
+                        self.emit(a64.ldr64(phys, REGS_PTR, @as(u16, vreg) * 8));
+                    }
+                }
+            }
+
+            // Restore x30 and return to continue execution
+            self.emit(a64.ldpPost(29, 30, 31, 2)); // LDP x29, x30, [sp], #16
+            self.emit(a64.ret_());
+
+            // .exit_error: x0 already has error code, jump to shared exit
+            const exit_error_idx = self.currentIdx();
+            self.emit(a64.ldpPost(29, 30, 31, 2)); // LDP x29, x30, [sp], #16
+            {
+                const exit_offset: i26 = @intCast(@as(i32, @intCast(shared_exit)) - @as(i32, @intCast(self.currentIdx())));
+                self.emit(a64.b(exit_offset));
+            }
+
+            // Patch CBNZ to point to .exit_error
+            {
+                const offset: i19 = @intCast(@as(i32, @intCast(exit_error_idx)) - @as(i32, @intCast(exit_branch_idx)));
+                self.code.items[exit_branch_idx] = a64.cbnz64(0, offset);
+            }
+
+            // Patch all fuel check BL instructions to branch to this stub
+            for (self.fuel_check_branches.items) |bl_idx| {
+                const offset: i32 = @as(i32, @intCast(fuel_stub_idx)) - @as(i32, @intCast(bl_idx));
+                const imm: u26 = @bitCast(@as(i26, @intCast(offset)));
+                self.code.items[bl_idx] = 0x94000000 | @as(u32, imm); // BL imm26
             }
         }
     }
@@ -7075,8 +7151,9 @@ pub fn compileFunction(
     compiler.use_guard_pages = use_guard_pages;
     compiler.osr_target_pc = osr_target_pc;
     compiler.gc_trampoline_addr = gc_trampoline_addr;
+    compiler.fuel_check_helper_addr = @intFromPtr(&vm_mod.Vm.jitFuelCheckHelper);
     compiler.jit_fuel_offset = @intCast(@offsetOf(vm_mod.Vm, "jit_fuel"));
-    compiler.simd_hi_offset = @intCast(@offsetOf(vm_mod.Vm, "simd_hi"));
+    compiler.simd_v128_offset = @intCast(@offsetOf(vm_mod.Vm, "simd_v128"));
 
     // Dump JIT code before deinit (pc_map still alive, one-shot)
     if (trace) |tc| {
