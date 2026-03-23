@@ -1985,6 +1985,38 @@ pub const Compiler = struct {
         self.emitCalleeSavedRestore();
     }
 
+    /// Multi-value return epilogue: stores N result vregs to regs[0..n-1].
+    fn emitEpilogueMulti(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) void {
+        const count: u32 = instr.operand;
+        self.emitStoreResultVreg(0, instr.rd);
+        if (count > 1) self.emitStoreResultVreg(1, instr.rs1);
+        var ri: u32 = 2;
+        while (ri < count and pc.* < ir.len) {
+            const nop = ir[pc.*];
+            pc.* += 1;
+            self.emitStoreResultVreg(ri, nop.rd);
+            ri += 1;
+            if (ri < count) {
+                self.emitStoreResultVreg(ri, nop.rs1);
+                ri += 1;
+            }
+        }
+        Enc.xorRegReg32(&self.code, self.alloc, .rax, .rax);
+        self.emitCalleeSavedRestore();
+    }
+
+    /// Store vreg value to regs[result_idx] for multi-value return.
+    fn emitStoreResultVreg(self: *Compiler, result_idx: u32, vreg: u16) void {
+        const disp: i32 = @as(i32, result_idx) * 8;
+        if (vregToPhys(vreg)) |phys| {
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, disp, phys);
+        } else {
+            const vreg_disp: i32 = @as(i32, vreg) * 8;
+            Enc.loadDisp32(&self.code, self.alloc, SCRATCH, REGS_PTR, vreg_disp);
+            Enc.storeDisp32(&self.code, self.alloc, REGS_PTR, disp, SCRATCH);
+        }
+    }
+
     /// Emit callee-saved register restore sequence.
     /// For self-call functions: checks [RSP] marker to determine restore path.
     /// Marker = 0 → self-call entry (only sub rsp 8), marker != 0 → normal entry (full restore).
@@ -5782,6 +5814,9 @@ pub const Compiler = struct {
             },
             regalloc_mod.OP_RETURN => {
                 self.emitEpilogue(if (self.result_count > 0) instr.rd else null);
+            },
+            regalloc_mod.OP_RETURN_MULTI => {
+                self.emitEpilogueMulti(instr, ir, pc);
             },
             regalloc_mod.OP_RETURN_VOID => self.emitEpilogue(null),
             regalloc_mod.OP_NOP, regalloc_mod.OP_BLOCK_END, regalloc_mod.OP_DELETED => {},

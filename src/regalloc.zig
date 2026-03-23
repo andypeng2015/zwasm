@@ -74,6 +74,10 @@ pub const OP_BLOCK_END: u16 = 0xFA;
 /// Deleted instruction marker — used by peephole to mark instructions for removal.
 /// Distinct from OP_NOP which may carry data (e.g., call arg registers).
 pub const OP_DELETED: u16 = 0xFB;
+/// return_multi rd, rs1, operand=count — return multiple values.
+/// rd = first result vreg, rs1 = second result vreg.
+/// If count > 2, following NOP instructions carry additional vregs (rd, rs1 per NOP).
+pub const OP_RETURN_MULTI: u16 = 0xFC;
 
 // ---- Immediate-operand fused instructions ----
 // Pattern: CONST32 + binop → single instruction with immediate in operand field.
@@ -331,16 +335,13 @@ pub fn convert(
     pool64: []const u64,
     param_count: u16,
     local_count: u16,
+    result_count: u16,
     resolver: ?ParamResolver,
 ) ConvertError!?*RegFunc {
     const total_locals = param_count + local_count;
 
     // Bail if locals exceed u8 register range (RegInstr fields are u8)
     if (total_locals > 255) return null;
-
-    // Multi-value return (>1) not supported in register IR yet.
-    // We don't know our own result count here, but the executor handles it.
-    // For functions with >1 results, the caller should not use register IR.
 
     var code: std.ArrayList(RegInstr) = .empty;
     var code_transferred = false;
@@ -729,7 +730,29 @@ pub fn convert(
             0x0B => { // end
                 if (block_stack.items.len == 0) {
                     // Function-level end: return
-                    if (vstack.items.len > 0) {
+                    if (result_count > 1 and vstack.items.len >= result_count) {
+                        // Multi-value return: pop results in reverse order
+                        // Stack top = last result, bottom = first result
+                        var result_vregs: [8]u16 = undefined;
+                        var i: u16 = result_count;
+                        while (i > 0) : (i -= 1) {
+                            result_vregs[i - 1] = temps.popFree(&vstack).?;
+                        }
+                        // Encode: rd=first, rs1=second, operand=count
+                        try code.append(alloc, .{
+                            .op = OP_RETURN_MULTI,
+                            .rd = result_vregs[0],
+                            .rs1 = result_vregs[1],
+                            .operand = result_count,
+                        });
+                        // Additional results in following NOP instructions
+                        var j: u16 = 2;
+                        while (j < result_count) : (j += 2) {
+                            const r0 = result_vregs[j];
+                            const r1 = if (j + 1 < result_count) result_vregs[j + 1] else 0;
+                            try code.append(alloc, .{ .op = OP_NOP, .rd = r0, .rs1 = r1, .operand = 0 });
+                        }
+                    } else if (vstack.items.len > 0) {
                         const val = temps.popFree(&vstack).?;
                         try code.append(alloc, .{ .op = OP_RETURN, .rd = val, .rs1 = 0, .operand = 0 });
                     } else {
@@ -860,7 +883,25 @@ pub fn convert(
 
             // ---- Return ----
             0x0F => { // return
-                if (vstack.items.len > 0) {
+                if (result_count > 1 and vstack.items.len >= result_count) {
+                    var result_vregs: [8]u16 = undefined;
+                    var ri: u16 = result_count;
+                    while (ri > 0) : (ri -= 1) {
+                        result_vregs[ri - 1] = temps.popFree(&vstack).?;
+                    }
+                    try code.append(alloc, .{
+                        .op = OP_RETURN_MULTI,
+                        .rd = result_vregs[0],
+                        .rs1 = result_vregs[1],
+                        .operand = result_count,
+                    });
+                    var rj: u16 = 2;
+                    while (rj < result_count) : (rj += 2) {
+                        const r0 = result_vregs[rj];
+                        const r1 = if (rj + 1 < result_count) result_vregs[rj + 1] else 0;
+                        try code.append(alloc, .{ .op = OP_NOP, .rd = r0, .rs1 = r1, .operand = 0 });
+                    }
+                } else if (vstack.items.len > 0) {
                     const val = temps.popFree(&vstack).?;
                     try code.append(alloc, .{ .op = OP_RETURN, .rd = val, .rs1 = 0, .operand = 0 });
                 } else {
@@ -1375,8 +1416,9 @@ pub fn convert(
     }
 
     // If we fell through (no end instruction), add return
-    if (code.items.len == 0 or code.items[code.items.len - 1].op != OP_RETURN and
-        code.items[code.items.len - 1].op != OP_RETURN_VOID)
+    if (code.items.len == 0 or (code.items[code.items.len - 1].op != OP_RETURN and
+        code.items[code.items.len - 1].op != OP_RETURN_MULTI and
+        code.items[code.items.len - 1].op != OP_RETURN_VOID))
     {
         try code.append(alloc, .{ .op = OP_RETURN_VOID, .rd = 0, .rs1 = 0, .operand = 0 });
     }
@@ -1450,7 +1492,7 @@ fn copyPropagate(code: []RegInstr, local_count: u16) void {
 
         // Don't fold if the producer is itself a MOV, branch, return, or store-like
         switch (producer.op) {
-            OP_MOV, OP_BR, OP_BR_IF, OP_BR_IF_NOT, OP_RETURN, OP_RETURN_VOID,
+            OP_MOV, OP_BR, OP_BR_IF, OP_BR_IF_NOT, OP_RETURN, OP_RETURN_MULTI, OP_RETURN_VOID,
             OP_NOP, OP_BLOCK_END, OP_DELETED, OP_BR_TABLE,
             OP_MEMORY_FILL, OP_MEMORY_COPY,
             => continue,
@@ -1659,7 +1701,7 @@ test "convert — simple i32.add(local.get 0, local.get 1)" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1686,7 +1728,7 @@ test "convert — local.get eliminates to register reference" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 },
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1709,7 +1751,7 @@ test "convert — i32.const + local.set" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 },
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 0, 1, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 0, 1, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1756,7 +1798,7 @@ test "convert — local.tee aliasing: stale vstack reference" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1778,7 +1820,7 @@ test "convert — graceful fallback when locals exceed u8 range" {
     const ir = [_]PreInstr{
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
-    const result = try convert(testing.allocator, &ir, &.{}, 200, 100, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 200, 100, 1, null);
     try testing.expect(result == null);
 }
 
@@ -1789,7 +1831,7 @@ test "convert — large register count succeeds with u16 regs" {
         ir[i] = .{ .opcode = 0x41, .extra = 0, .operand = @intCast(i) }; // i32.const
     }
     ir[7] = .{ .opcode = 0x0B, .extra = 0, .operand = 0 }; // end
-    const result = try convert(testing.allocator, &ir, &.{}, 250, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 250, 0, 1, null);
     try testing.expect(result != null);
     if (result) |r| {
         var rf = r;
@@ -1814,7 +1856,7 @@ test "convert — br_table with arity-0 targets" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end func
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1844,7 +1886,7 @@ test "convert — memory.fill emits OP_MEMORY_FILL" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 3, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 3, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1870,7 +1912,7 @@ test "copy propagation — const + local.set folds to direct const" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 0, 1, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 0, 1, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1899,7 +1941,7 @@ test "copy propagation — add + local.set folds" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 2, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1930,7 +1972,7 @@ test "copy propagation — preserves branch target MOVs" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end (func)
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1956,7 +1998,7 @@ test "copy propagation — does not fold when temp used by block-end MOV" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end (func)
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -1997,7 +2039,7 @@ test "convert — temp register reuse reduces reg_count" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 0, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 0, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -2019,7 +2061,7 @@ test "convert — temp reuse rescues >255 reg bailout" {
         ir[i * 2 + 1] = .{ .opcode = 0x1A, .extra = 0, .operand = 0 }; // drop
     }
     ir[14] = .{ .opcode = 0x0B, .extra = 0, .operand = 0 }; // end
-    const result = try convert(testing.allocator, &ir, &.{}, 250, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 250, 0, 1, null);
     // With reuse, drop frees the temp immediately → only 1 temp needed, max = 251
     try testing.expect(result != null);
     defer {
@@ -2053,7 +2095,7 @@ test "compactCode — br_table NOP targets adjusted on DELETED removal" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end func
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -2112,7 +2154,7 @@ test "convert — GC struct.new uses call-like arg packing" {
         .resolve_gc_field_count_fn = MockCtx.resolveGcFieldCount,
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 0, 0, resolver);
+    const result = try convert(testing.allocator, &ir, &.{}, 0, 0, 1, resolver);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -2146,7 +2188,7 @@ test "convert — GC struct.get produces unary register op" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &.{}, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -2212,7 +2254,7 @@ test "convert — v128.const + v128.store passes through regalloc" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &pool, 1, 0, null);
+    const result = try convert(testing.allocator, &ir, &pool, 1, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;
@@ -2242,7 +2284,7 @@ test "convert — f32x4.add binary passes through regalloc" {
         .{ .opcode = 0x0B, .extra = 0, .operand = 0 }, // end
     };
 
-    const result = try convert(testing.allocator, &ir, &pool, 0, 0, null);
+    const result = try convert(testing.allocator, &ir, &pool, 0, 0, 1, null);
     try testing.expect(result != null);
     defer {
         var r = result.?;

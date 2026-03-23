@@ -1582,7 +1582,7 @@ pub const Compiler = struct {
         return switch (op) {
             regalloc_mod.OP_NOP, regalloc_mod.OP_DELETED, regalloc_mod.OP_BLOCK_END,
             regalloc_mod.OP_BR, regalloc_mod.OP_BR_IF, regalloc_mod.OP_BR_IF_NOT,
-            regalloc_mod.OP_RETURN, regalloc_mod.OP_RETURN_VOID, regalloc_mod.OP_BR_TABLE,
+            regalloc_mod.OP_RETURN, regalloc_mod.OP_RETURN_MULTI, regalloc_mod.OP_RETURN_VOID, regalloc_mod.OP_BR_TABLE,
             => false,
             // Memory stores use rd as VALUE source, not a definition
             0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
@@ -2134,6 +2134,39 @@ pub const Compiler = struct {
         self.emit(a64.ret_());
     }
 
+    /// Multi-value return epilogue: stores N result vregs to regs[0..n-1].
+    fn emitEpilogueMulti(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) void {
+        const count: u32 = instr.operand;
+        // Store first two results from instr.rd and instr.rs1
+        self.emitStoreResultVreg(0, instr.rd);
+        if (count > 1) self.emitStoreResultVreg(1, instr.rs1);
+        // Additional results from following NOP instructions
+        var ri: u32 = 2;
+        while (ri < count and pc.* < ir.len) {
+            const nop = ir[pc.*];
+            pc.* += 1;
+            self.emitStoreResultVreg(ri, nop.rd);
+            ri += 1;
+            if (ri < count) {
+                self.emitStoreResultVreg(ri, nop.rs1);
+                ri += 1;
+            }
+        }
+        self.emitCalleeSavedRestore();
+        self.emit(a64.movz64(0, 0, 0));
+        self.emit(a64.ret_());
+    }
+
+    /// Store vreg value to regs[result_idx] for multi-value return.
+    fn emitStoreResultVreg(self: *Compiler, result_idx: u32, vreg: u16) void {
+        if (vregToPhys(vreg)) |phys| {
+            self.emit(a64.str64(phys, REGS_PTR, @intCast(result_idx * 8)));
+        } else {
+            self.emit(a64.ldr64(SCRATCH, REGS_PTR, @as(u16, vreg) * 8));
+            self.emit(a64.str64(SCRATCH, REGS_PTR, @intCast(result_idx * 8)));
+        }
+    }
+
     fn emitErrorReturn(self: *Compiler, error_code: u16) void {
         self.emitCalleeSavedRestore();
         self.emit(a64.movz64(0, error_code, 0));
@@ -2309,6 +2342,7 @@ pub const Compiler = struct {
             regalloc_mod.OP_CALL,
             regalloc_mod.OP_CALL_INDIRECT,
             regalloc_mod.OP_RETURN,
+            regalloc_mod.OP_RETURN_MULTI,
             regalloc_mod.OP_RETURN_VOID,
             => true,
             else => false,
@@ -2562,6 +2596,10 @@ pub const Compiler = struct {
             regalloc_mod.OP_RETURN => {
                 self.fpCacheEvictAll();
                 self.emitEpilogue(instr.rd);
+            },
+            regalloc_mod.OP_RETURN_MULTI => {
+                self.fpCacheEvictAll();
+                self.emitEpilogueMulti(instr, ir, pc);
             },
             regalloc_mod.OP_RETURN_VOID => {
                 self.fpCacheEvictAll();

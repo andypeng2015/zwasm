@@ -616,7 +616,7 @@ pub const Vm = struct {
                 };
 
                 // Try register IR conversion (requires predecoded IR)
-                // Skip for: multi-value return, v128 params/results (u64 regs can't hold v128)
+                // Skip for: multi-value return (blocks not yet supported), v128 params/results
                 if (wf.ir != null and wf.reg_ir == null and !wf.reg_ir_failed and
                     func_ptr.results.len <= 1 and !has_v128)
                 {
@@ -659,6 +659,7 @@ pub const Vm = struct {
                         wf.ir.?.pool64,
                         @intCast(func_ptr.params.len),
                         @intCast(wf.locals_count),
+                        @intCast(func_ptr.results.len),
                         resolver,
                     ) catch null;
                     if (wf.reg_ir == null) {
@@ -4367,8 +4368,10 @@ pub const Vm = struct {
             return jitErrorCode(err_code);
         }
 
-        // Result is in regs[0]
-        if (results.len > 0) results[0] = self.reg_stack[base];
+        // Results are in regs[0..n]
+        for (results, 0..) |*r, i| {
+            r.* = self.reg_stack[base + i];
+        }
     }
 
     fn executeJIT(
@@ -4425,8 +4428,10 @@ pub const Vm = struct {
             return jitErrorCode(err_code);
         }
 
-        // Result is in regs[0]
-        if (results.len > 0) results[0] = regs[0];
+        // Results are in regs[0..n]
+        for (results, 0..) |*r, i| {
+            r.* = regs[i];
+        }
     }
 
     // ================================================================
@@ -4624,6 +4629,25 @@ pub const Vm = struct {
 
                 regalloc_mod.OP_RETURN => {
                     if (results.len > 0) results[0] = regs[instr.rd];
+                    return;
+                },
+
+                regalloc_mod.OP_RETURN_MULTI => {
+                    const count: u32 = instr.operand;
+                    if (results.len > 0) results[0] = regs[instr.rd];
+                    if (results.len > 1) results[1] = regs[instr.rs1];
+                    // Additional results from following NOP instructions
+                    var ri: u32 = 2;
+                    while (ri < count and ri < results.len) {
+                        const nop = code[pc];
+                        pc += 1;
+                        results[ri] = regs[nop.rd];
+                        ri += 1;
+                        if (ri < count and ri < results.len) {
+                            results[ri] = regs[nop.rs1];
+                            ri += 1;
+                        }
+                    }
                     return;
                 },
 
@@ -7027,6 +7051,7 @@ pub const Vm = struct {
                             wf.ir.?.pool64,
                             @intCast(current_fp.params.len),
                             @intCast(wf.locals_count),
+                            @intCast(current_fp.results.len),
                             resolver,
                         ) catch null;
                         if (wf.reg_ir == null) {

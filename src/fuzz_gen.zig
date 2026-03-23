@@ -1969,6 +1969,7 @@ test "fuzz-phase — regalloc does not panic on predecoded IR" {
                     func.pool64,
                     0, // param_count
                     0, // local_count
+                    1, // result_count
                     null, // resolver
                 ) catch return;
                 if (reg) |rf| {
