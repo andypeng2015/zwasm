@@ -343,6 +343,9 @@ pub fn convert(
     // Bail if locals exceed u8 register range (RegInstr fields are u8)
     if (total_locals > 255) return null;
 
+    // Bail if result count exceeds encoding capacity (8 results max)
+    if (result_count > 8) return null;
+
     var code: std.ArrayList(RegInstr) = .empty;
     var code_transferred = false;
     defer if (!code_transferred) code.deinit(alloc);

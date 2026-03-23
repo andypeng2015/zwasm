@@ -616,9 +616,9 @@ pub const Vm = struct {
                 };
 
                 // Try register IR conversion (requires predecoded IR)
-                // Skip for: multi-value return (blocks not yet supported), v128 params/results
+                // Skip for: v128 params/results
                 if (wf.ir != null and wf.reg_ir == null and !wf.reg_ir_failed and
-                    func_ptr.results.len <= 1 and !has_v128)
+                    !has_v128)
                 {
                     const resolver = regalloc_mod.ParamResolver{
                         .ctx = @ptrCast(inst),
@@ -4677,9 +4677,9 @@ pub const Vm = struct {
                         if (n_args > 7) call_args[7] = regs[@as(u16, @truncate(data2.operand))];
                     }
 
-                    var call_results: [1]u64 = .{0};
+                    var call_results: [8]u64 = .{0} ** 8;
                     const n_results = callee_fn.results.len;
-                    try self.callFunction(instance, callee_fn, call_args[0..n_args], call_results[0..n_results]);
+                    try self.callFunction(instance, callee_fn, call_args[0..n_args], call_results[0..@min(n_results, 8)]);
                     if (n_results > 0) regs[instr.rd] = call_results[0];
                 },
 
@@ -4713,9 +4713,9 @@ pub const Vm = struct {
                         if (n_args > 7) call_args[7] = regs[@as(u16, @truncate(data2.operand))];
                     }
 
-                    var call_results: [1]u64 = .{0};
+                    var call_results: [8]u64 = .{0} ** 8;
                     const n_results = callee_fn.results.len;
-                    try self.callFunction(instance, callee_fn, call_args[0..n_args], call_results[0..n_results]);
+                    try self.callFunction(instance, callee_fn, call_args[0..n_args], call_results[0..@min(n_results, 8)]);
                     if (n_results > 0) regs[instr.rd] = call_results[0];
                 },
 
@@ -7008,9 +7008,7 @@ pub const Vm = struct {
                     }
 
                     // Trigger regIR conversion for callees of stack-IR functions.
-                    if (wf.ir != null and wf.reg_ir == null and !wf.reg_ir_failed and
-                        current_fp.results.len <= 1)
-                    {
+                    if (wf.ir != null and wf.reg_ir == null and !wf.reg_ir_failed) {
                         const callee_inst: *Instance = @ptrCast(@alignCast(wf.instance));
                         const resolver = regalloc_mod.ParamResolver{
                             .ctx = @ptrCast(callee_inst),
@@ -7095,10 +7093,10 @@ pub const Vm = struct {
                                         arg_buf[i] = @truncate(self.op_stack[locals_start + i]);
                                     }
                                     self.op_ptr = locals_start;
-                                    var call_results: [1]u64 = .{0};
+                                    var call_results: [8]u64 = .{0} ** 8;
                                     const n_results = current_fp.results.len;
-                                    try self.executeJIT(jc, reg, instance, current_fp, arg_buf[0..param_count], call_results[0..n_results]);
-                                    if (n_results > 0) try self.push(call_results[0]);
+                                    try self.executeJIT(jc, reg, instance, current_fp, arg_buf[0..param_count], call_results[0..@min(n_results, 8)]);
+                                    for (call_results[0..n_results]) |cr| try self.push(cr);
                                     return;
                                 }
                             }
