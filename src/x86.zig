@@ -4067,6 +4067,158 @@ pub const Compiler = struct {
                 return true;
             },
 
+            0x08 => { // v128.load16_splat
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 2);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                Enc.loadBaseIdx32(&self.code, self.alloc, SCRATCH, MEM_BASE, SCRATCH);
+                Enc.movdToXmm(&self.code, self.alloc, SIMD_SCRATCH0, SCRATCH);
+                Enc.pshufd(&self.code, self.alloc, SIMD_SCRATCH0, SIMD_SCRATCH0, 0x00);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
+            // --- load/store lane ---
+            0x54 => { // v128.load8_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 1);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs2_field);
+                Enc.loadBaseIdx32(&self.code, self.alloc, SCRATCH2, MEM_BASE, SCRATCH);
+                Enc.pinsrb(&self.code, self.alloc, SIMD_SCRATCH0, SCRATCH2, @truncate(extra));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x55 => { // v128.load16_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 2);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs2_field);
+                Enc.loadBaseIdx32(&self.code, self.alloc, SCRATCH2, MEM_BASE, SCRATCH);
+                Enc.pinsrw(&self.code, self.alloc, SIMD_SCRATCH0, SCRATCH2, @truncate(extra));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x56 => { // v128.load32_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 4);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs2_field);
+                Enc.loadBaseIdx32(&self.code, self.alloc, SCRATCH2, MEM_BASE, SCRATCH);
+                Enc.pinsrd(&self.code, self.alloc, SIMD_SCRATCH0, SCRATCH2, @truncate(extra));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x57 => { // v128.load64_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 8);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs2_field);
+                Enc.loadBaseIdx64(&self.code, self.alloc, SCRATCH2, MEM_BASE, SCRATCH);
+                Enc.pinsrqReg(&self.code, self.alloc, SIMD_SCRATCH0, SCRATCH2, @truncate(extra));
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x58 => { // v128.store8_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 1);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rd);
+                Enc.pextrb(&self.code, self.alloc, SCRATCH2, SIMD_SCRATCH0, @truncate(extra));
+                Enc.storeBaseIdx8(&self.code, self.alloc, MEM_BASE, SCRATCH, SCRATCH2);
+                return true;
+            },
+            0x59 => { // v128.store16_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 2);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rd);
+                Enc.pextrw41(&self.code, self.alloc, SCRATCH2, SIMD_SCRATCH0, @truncate(extra));
+                Enc.storeBaseIdx16(&self.code, self.alloc, MEM_BASE, SCRATCH, SCRATCH2);
+                return true;
+            },
+            0x5A => { // v128.store32_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 4);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rd);
+                Enc.pextrd(&self.code, self.alloc, SCRATCH2, SIMD_SCRATCH0, @truncate(extra));
+                Enc.storeBaseIdx32(&self.code, self.alloc, MEM_BASE, SCRATCH, SCRATCH2);
+                return true;
+            },
+            0x5B => { // v128.store64_lane
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                Enc.movRegReg32(&self.code, self.alloc, SCRATCH, addr_reg);
+                self.emitAddOffset(instr.operand);
+                if (!self.use_guard_pages) {
+                    Enc.movRegReg(&self.code, self.alloc, SCRATCH2, SCRATCH);
+                    Enc.addImm32(&self.code, self.alloc, SCRATCH2, 8);
+                    Enc.cmpRegReg(&self.code, self.alloc, SCRATCH2, MEM_SIZE);
+                    self.emitCondError(.a, 6);
+                }
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rd);
+                Enc.pextrqReg(&self.code, self.alloc, SCRATCH2, SIMD_SCRATCH0, @truncate(extra));
+                Enc.storeBaseIdx64(&self.code, self.alloc, MEM_BASE, SCRATCH, SCRATCH2);
+                return true;
+            },
+
             // --- load zero ---
             0x5C => { // v128.load32_zero
                 if (!self.has_memory) return false;
