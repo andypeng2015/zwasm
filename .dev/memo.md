@@ -49,8 +49,11 @@ Session handover document. Read at session start.
     splat, extend/narrow, shift, convert, demote/promote, bitmask, swizzle,
     bitselect, any/all_true, dot, q15mulr
   - Ubuntu x86_64: 62,263/62,263 spec tests pass
-  - Remaining trampoline (~24 non-relaxed + 20 relaxed): byte shift/shuffle/popcnt,
-    extmul, extadd_pairwise, i64x2 mul/abs/shr_s, unsigned convert
+  - ARM64: **253/256 native** (98.8%), trampoline: relaxed_dot (2), one relaxed_laneselect
+  - x86: **244/256 native** (95.3%), trampoline: byte shift (3), popcnt (1),
+    i64x2.shr_s (1), unsigned trunc/convert (5), relaxed_dot (2)
+  - **Phase 13.7 TODO**: SIMD real-world benchmark expansion, wasmtime comparison,
+    README + docs + book update
   - **Long-term**: NEON register allocator or contiguous v128 storage
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
