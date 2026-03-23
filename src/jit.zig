@@ -5171,6 +5171,205 @@ pub const Compiler = struct {
                 self.emit(a64.strQreg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
                 return true;
             },
+            // --- v128.load_splat ---
+            0x07 => { // v128.load8_splat: load 1 byte, splat to 16 lanes
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 1));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrbReg(SCRATCH, MEM_BASE, SCRATCH));
+                // DUP V0.16B, Wn = 0x4E010C00
+                self.emit(0x4E010C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x08 => { // v128.load16_splat: load 2 bytes, splat to 8 lanes
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 2));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrhReg(SCRATCH, MEM_BASE, SCRATCH));
+                // DUP V0.8H, Wn = 0x4E020C00
+                self.emit(0x4E020C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x09 => { // v128.load32_splat: load 4 bytes, splat to 4 lanes
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 4));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldr32Reg(SCRATCH, MEM_BASE, SCRATCH));
+                // DUP V0.4S, Wn = 0x4E040C00
+                self.emit(0x4E040C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x0A => { // v128.load64_splat: load 8 bytes, splat to 2 lanes
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldr64Reg(SCRATCH, MEM_BASE, SCRATCH));
+                // DUP V0.2D, Xn = 0x4E080C00
+                self.emit(0x4E080C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
+            // --- v128.load_zero ---
+            0x5C => { // v128.load32_zero: load 4 bytes into lane 0, zero rest
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 4));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldr32Reg(SCRATCH, MEM_BASE, SCRATCH));
+                // Store as GP vreg (lo = value, hi = 0)
+                const d = destReg(instr.rd);
+                self.emit(a64.mov32(d, SCRATCH));
+                self.storeVreg(instr.rd, d);
+                // Zero simd_hi
+                self.emitLoadVmPtr(SCRATCH2);
+                const hi_offset = self.simd_hi_offset + @as(u32, instr.rd) * 8;
+                if (hi_offset <= 32760) {
+                    self.emit(a64.str64(31, SCRATCH2, @intCast(hi_offset))); // XZR
+                } else {
+                    const off_instrs = a64.loadImm64(SCRATCH, hi_offset);
+                    for (off_instrs) |inst| self.emit(inst);
+                    self.emit(a64.add64(SCRATCH2, SCRATCH2, SCRATCH));
+                    self.emit(a64.str64(31, SCRATCH2, 0));
+                }
+                return true;
+            },
+            0x5D => { // v128.load64_zero: load 8 bytes into lane 0, zero rest
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldr64Reg(SCRATCH, MEM_BASE, SCRATCH));
+                // Store as GP vreg (lo = value, hi = 0)
+                const d = destReg(instr.rd);
+                self.emit(a64.mov64(d, SCRATCH));
+                self.storeVreg(instr.rd, d);
+                // Zero simd_hi
+                self.emitLoadVmPtr(SCRATCH2);
+                const hi_offset = self.simd_hi_offset + @as(u32, instr.rd) * 8;
+                if (hi_offset <= 32760) {
+                    self.emit(a64.str64(31, SCRATCH2, @intCast(hi_offset)));
+                } else {
+                    const off_instrs = a64.loadImm64(SCRATCH, hi_offset);
+                    for (off_instrs) |inst| self.emit(inst);
+                    self.emit(a64.add64(SCRATCH2, SCRATCH2, SCRATCH));
+                    self.emit(a64.str64(31, SCRATCH2, 0));
+                }
+                return true;
+            },
+
+            // --- v128.load_extend ---
+            0x01 => { // v128.load8x8_s: load 8 bytes, sign-extend to 8 halfwords
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                // LDR D0, [MEM_BASE, SCRATCH] — load 64 bits into lower half
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // SSHLL V0.8H, V0.8B, #0 = 0x0F08A400
+                self.emit(0x0F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x02 => { // v128.load8x8_u: load 8 bytes, zero-extend to 8 halfwords
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // USHLL V0.8H, V0.8B, #0 = 0x2F08A400
+                self.emit(0x2F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x03 => { // v128.load16x4_s: load 8 bytes, sign-extend 4 halfwords to 4 words
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // SSHLL V0.4S, V0.4H, #0 = 0x0F10A400
+                self.emit(0x0F10A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x04 => { // v128.load16x4_u
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // USHLL V0.4S, V0.4H, #0 = 0x2F10A400
+                self.emit(0x2F10A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x05 => { // v128.load32x2_s: load 8 bytes, sign-extend 2 words to 2 doublewords
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // SSHLL V0.2D, V0.2S, #0 = 0x0F20A400
+                self.emit(0x0F20A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x06 => { // v128.load32x2_u
+                if (!self.has_memory) return false;
+                const addr_reg = self.getOrLoad(instr.rs1, SCRATCH);
+                self.emit(a64.uxtw(SCRATCH, addr_reg));
+                self.emitAddOffset(SCRATCH, instr.operand);
+                self.emit(a64.addImm64(SCRATCH2, SCRATCH, 8));
+                self.emit(a64.cmp64(SCRATCH2, MEM_SIZE));
+                self.emitCondError(.hi, 6);
+                self.emit(a64.ldrFp64Reg(SIMD_SCRATCH0, MEM_BASE, SCRATCH));
+                // USHLL V0.2D, V0.2S, #0 = 0x2F20A400
+                self.emit(0x2F20A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
             // --- v128.const ---
             0x0C => {
                 // Load 128-bit constant from pool64[operand] (2x u64)
