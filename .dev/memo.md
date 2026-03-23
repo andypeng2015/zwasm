@@ -30,18 +30,19 @@ Session handover document. Read at session start.
   - SIMD bench: 19-30x slower than scalar (trampoline overhead, was 20-53x)
   - All tests + samples pass. JIT compiles SIMD hot loops.
 - **5 real-world SIMD C samples** in test/realworld/c_simd/ (wasi-sdk -msimd128)
-- **13.2+ Native NEON** (in progress): **161 opcodes** now native ARM64
-  - All comparisons: integer (i8x16/i16x8/i32x4 × s/u, i64x2 signed), float (f32x4/f64x2)
-  - All integer arithmetic: add/sub/mul, abs/neg/min/max, saturating add/sub
-  - All integer shifts: i8x16/i16x8/i32x4/i64x2 shl/shr_s/shr_u
-  - All float arithmetic: f32x4/f64x2 add/sub/mul/div/min/max/abs/neg/sqrt
-  - All extract_lane/replace_lane, extadd_pairwise
-  - v128.load/store, v128.const, splat (6 types), bitwise (and/andnot/or/xor/not)
-  - i16x8 extend (s/u), i8x16 narrow (s/u), i8x16 avgr_u
+- **13.2+ Native NEON** (in progress): **178 opcodes** now native ARM64
+  - All comparisons (integer + float), all integer arithmetic + saturating
+  - All shifts, all extract/replace_lane, all extadd_pairwise
+  - All float arithmetic (add/sub/mul/div/min/max/abs/neg/sqrt)
+  - All extend (i16x8←i8x16, i32x4←i16x8, i64x2←i32x4), all narrow
+  - v128.load/store/const, splat, bitwise, bitselect
+  - i8x16.swizzle (TBL), i8x16.popcnt (CNT)
+  - i32x4 trunc_sat_f32x4 (s/u), f32x4 convert_i32x4 (s/u)
   - SIMD bench: image_blend 4.8x faster than scalar, matrix_mul 1.3x
+  - **Remaining**: bitmask, any/all_true, i32x4.dot, i64x2.mul, f64x2⇔i32x4/f32x4 convert, rounding, pmin/pmax, i8x16 avgr, i16x8 avgr, i16x8 q15mulr, i32x4 extmul, i64x2 extmul
   - **Next priorities**:
-    1. More native opcodes (bitmask, any_true/all_true, i32x4.dot, i64x2.mul, convert, extend i32x4/i64x2)
-    2. x86 SSE port (D6: both ISAs per opcode group)
+    1. Remaining native opcodes (above list)
+    2. x86 SSE port
     3. Long-term: NEON register allocator or contiguous v128 storage
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
