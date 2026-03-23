@@ -31,6 +31,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const regalloc_mod = @import("regalloc.zig");
+const predecode_mod = @import("predecode.zig");
 const RegInstr = regalloc_mod.RegInstr;
 const RegFunc = regalloc_mod.RegFunc;
 const store_mod = @import("store.zig");
@@ -137,6 +138,11 @@ const Enc = struct {
     }
 
     /// ModR/M for [rm + disp32] (mod=10).
+    /// SIB byte: scale(2) index(3) base(3)
+    fn sib(scale: u2, index: u3, base: u3) u8 {
+        return (@as(u8, scale) << 6) | (@as(u8, index) << 3) | base;
+    }
+
     fn modrmDisp32(reg: Reg, rm: Reg) u8 {
         return modrm(0b10, reg.low3(), rm.low3());
     }
@@ -943,6 +949,133 @@ const Enc = struct {
     fn orps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x56, dst, src); }
     fn xorps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x57, dst, src); }
 
+    // --- SSE2/SSE4.1 v128 packed ops (for SIMD JIT) ---
+
+    /// MOVQ xmm, [base + disp32]: 66 REX.W [0F 6E] ModRM [SIB] disp32
+    fn movqXmmFromMem(buf: *std.ArrayList(u8), alloc: Allocator, xmm: u4, base: Reg, disp: i32) void {
+        buf.append(alloc, 0x66) catch {};
+        var r: u8 = 0x48; // REX.W
+        if (xmm >= 8) r |= 0x04; // REX.R
+        if (base.isExt()) r |= 0x01; // REX.B
+        buf.append(alloc, r) catch {};
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0x6E }) catch {};
+        // ModRM: mod=10 (disp32), reg=xmm, rm=base
+        buf.append(alloc, modrm(2, @truncate(xmm), base.low3())) catch {};
+        if (base.low3() == 4) buf.append(alloc, 0x24) catch {}; // SIB for RSP/R12
+        appendI32(buf, alloc, disp);
+    }
+
+    /// MOVQ [base + disp32], xmm: 66 REX.W [0F D6] ModRM [SIB] disp32
+    fn movqXmmToMem(buf: *std.ArrayList(u8), alloc: Allocator, base: Reg, disp: i32, xmm: u4) void {
+        buf.append(alloc, 0x66) catch {};
+        var r: u8 = 0x48; // REX.W
+        if (xmm >= 8) r |= 0x04; // REX.R
+        if (base.isExt()) r |= 0x01; // REX.B
+        buf.append(alloc, r) catch {};
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0xD6 }) catch {};
+        buf.append(alloc, modrm(2, @truncate(xmm), base.low3())) catch {};
+        if (base.low3() == 4) buf.append(alloc, 0x24) catch {};
+        appendI32(buf, alloc, disp);
+    }
+
+    /// PINSRQ xmm, [base + disp32], imm8: 66 REX.W [0F 3A 22] ModRM [SIB] disp32 imm8 (SSE4.1)
+    fn pinsrqMem(buf: *std.ArrayList(u8), alloc: Allocator, xmm: u4, base: Reg, disp: i32, imm8: u8) void {
+        buf.append(alloc, 0x66) catch {};
+        var r: u8 = 0x48;
+        if (xmm >= 8) r |= 0x04;
+        if (base.isExt()) r |= 0x01;
+        buf.append(alloc, r) catch {};
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0x3A, 0x22 }) catch {};
+        buf.append(alloc, modrm(2, @truncate(xmm), base.low3())) catch {};
+        if (base.low3() == 4) buf.append(alloc, 0x24) catch {};
+        appendI32(buf, alloc, disp);
+        buf.append(alloc, imm8) catch {};
+    }
+
+    /// PEXTRQ [base + disp32], xmm, imm8: 66 REX.W [0F 3A 16] ModRM [SIB] disp32 imm8 (SSE4.1)
+    fn pextrqMem(buf: *std.ArrayList(u8), alloc: Allocator, base: Reg, disp: i32, xmm: u4, imm8: u8) void {
+        buf.append(alloc, 0x66) catch {};
+        var r: u8 = 0x48;
+        if (xmm >= 8) r |= 0x04;
+        if (base.isExt()) r |= 0x01;
+        buf.append(alloc, r) catch {};
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0x3A, 0x16 }) catch {};
+        buf.append(alloc, modrm(2, @truncate(xmm), base.low3())) catch {};
+        if (base.low3() == 4) buf.append(alloc, 0x24) catch {};
+        appendI32(buf, alloc, disp);
+        buf.append(alloc, imm8) catch {};
+    }
+
+    /// MOVDQU xmm, [base + idx]: F3 [REX] 0F 6F ModRM(mod=00, reg=xmm, rm=100) SIB(base,idx)
+    fn movdquLoad(buf: *std.ArrayList(u8), alloc: Allocator, xmm: u4, base: Reg, idx: Reg) void {
+        buf.append(alloc, 0xF3) catch {};
+        if (xmm >= 8 or base.isExt() or idx.isExt()) {
+            var r: u8 = 0x40;
+            if (xmm >= 8) r |= 0x04; // REX.R
+            if (idx.isExt()) r |= 0x02; // REX.X
+            if (base.isExt()) r |= 0x01; // REX.B
+            buf.append(alloc, r) catch {};
+        }
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0x6F }) catch {};
+        // ModRM: mod=00, reg=xmm, rm=100 (SIB follows)
+        buf.append(alloc, modrm(0, @truncate(xmm), 4)) catch {};
+        // SIB: scale=0, index=idx, base=base
+        buf.append(alloc, sib(0, idx.low3(), base.low3())) catch {};
+    }
+
+    /// MOVDQU [base + idx], xmm: F3 [REX] 0F 7F ModRM SIB
+    fn movdquStore(buf: *std.ArrayList(u8), alloc: Allocator, base: Reg, idx: Reg, xmm: u4) void {
+        buf.append(alloc, 0xF3) catch {};
+        if (xmm >= 8 or base.isExt() or idx.isExt()) {
+            var r: u8 = 0x40;
+            if (xmm >= 8) r |= 0x04;
+            if (idx.isExt()) r |= 0x02;
+            if (base.isExt()) r |= 0x01;
+            buf.append(alloc, r) catch {};
+        }
+        buf.appendSlice(alloc, &[_]u8{ 0x0F, 0x7F }) catch {};
+        buf.append(alloc, modrm(0, @truncate(xmm), 4)) catch {};
+        buf.append(alloc, sib(0, idx.low3(), base.low3())) catch {};
+    }
+
+    /// SSE2 packed integer binary op: 66 [REX] 0F opcode ModRM (xmm, xmm)
+    fn ssePacked(buf: *std.ArrayList(u8), alloc: Allocator, op: u8, dst: u4, src: u4) void {
+        sseOp(buf, alloc, 0x66, 0x0F, op, dst, src);
+    }
+
+    // Packed integer arithmetic (all SSE2: 66 0F xx)
+    fn paddb(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xFC, dst, src); }
+    fn paddw(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xFD, dst, src); }
+    fn paddd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xFE, dst, src); }
+    fn paddq(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xD4, dst, src); }
+    fn psubb(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xF8, dst, src); }
+    fn psubw(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xF9, dst, src); }
+    fn psubd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xFA, dst, src); }
+    fn psubq(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xFB, dst, src); }
+    fn pmullw(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xD5, dst, src); }
+    fn pand(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xDB, dst, src); }
+    fn pandn(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xDF, dst, src); }
+    fn por(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xEB, dst, src); }
+    fn pxor(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0xEF, dst, src); }
+    fn pcmpeqb(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x74, dst, src); }
+    fn pcmpeqw(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x75, dst, src); }
+    fn pcmpeqd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x76, dst, src); }
+    fn pcmpgtb(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x64, dst, src); }
+    fn pcmpgtw(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x65, dst, src); }
+    fn pcmpgtd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x66, dst, src); }
+
+    // Packed float ops (SSE/SSE2)
+    fn addps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x58, dst, src); }
+    fn subps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x5C, dst, src); }
+    fn mulps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x59, dst, src); }
+    fn divps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x5E, dst, src); }
+    fn sqrtps(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { sseOpNp(buf, alloc, 0x51, dst, src); }
+    fn addpd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x58, dst, src); }
+    fn subpd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x5C, dst, src); }
+    fn mulpd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x59, dst, src); }
+    fn divpd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x5E, dst, src); }
+    fn sqrtpd(buf: *std.ArrayList(u8), alloc: Allocator, dst: u4, src: u4) void { ssePacked(buf, alloc, 0x51, dst, src); }
+
     /// CVTSI2SD xmm, r64: F2 REX.W 0F 2A /r (signed i64 → f64)
     fn cvtsi2sd64(buf: *std.ArrayList(u8), alloc: Allocator, xmm: u4, gpr: Reg) void {
         buf.append(alloc, 0xF2) catch {};
@@ -1228,6 +1361,12 @@ pub const Compiler = struct {
     known_consts: [128]?u32,
     written_vregs: u128,
     scratch_vreg: ?u16,
+    /// Offset of Vm.simd_hi field (for v128 upper 64-bit storage).
+    simd_hi_offset: u32,
+    /// True when the function uses SIMD opcodes (skip simd_hi handling if false).
+    has_simd: bool,
+    /// Address of jitSimdTrampoline function.
+    simd_trampoline_addr: u64,
     /// True when the memory has guard pages — skip explicit bounds checks.
     use_guard_pages: bool,
     /// Byte offset of the shared error epilogue (for signal handler recovery).
@@ -1288,6 +1427,9 @@ pub const Compiler = struct {
             .known_consts = .{null} ** 128,
             .written_vregs = 0,
             .scratch_vreg = null,
+            .simd_hi_offset = 0,
+            .has_simd = false,
+            .simd_trampoline_addr = 0,
             .use_guard_pages = false,
             .shared_exit_offset = 0,
             .osr_target_pc = null,
@@ -3210,6 +3352,14 @@ pub const Compiler = struct {
         self.has_self_call = found_self_call;
         self.self_call_only = found_self_call and !found_other_call;
 
+        // Scan for SIMD opcodes
+        for (reg_func.code) |instr| {
+            if (instr.op >= predecode_mod.SIMD_BASE and instr.op <= predecode_mod.SIMD_BASE + 0x113) {
+                self.has_simd = true;
+                break;
+            }
+        }
+
         // Detect reentry guard: early branch to unreachable in first 8 IR instructions.
         // JitRestart re-executes from pc=0; guard already passed, so skip it in JIT code.
         const guard_limit = @min(reg_func.code.len, 8);
@@ -3275,6 +3425,162 @@ pub const Compiler = struct {
         return self.finalize();
     }
 
+    // --- SIMD v128 helpers ---
+
+    const SIMD_SCRATCH0: u4 = 3; // XMM3
+    const SIMD_SCRATCH1: u4 = 4; // XMM4
+
+    /// Load v128 from regs[vreg] (lo) + simd_hi[vreg] (hi) into XMM register.
+    fn emitLoadV128(self: *Compiler, xmm: u4, vreg: u16) void {
+        const lo_disp: i32 = @as(i32, vreg) * 8;
+        // MOVQ xmm, [REGS_PTR + vreg*8] — loads lo 64 bits, zeros hi
+        Enc.movqXmmFromMem(&self.code, self.alloc, xmm, REGS_PTR, lo_disp);
+        // Load vm_ptr into SCRATCH2, then PINSRQ xmm, [SCRATCH2 + hi_off], 1
+        self.emitLoadVmPtr(SCRATCH2);
+        const hi_disp: i32 = @as(i32, @intCast(self.simd_hi_offset)) + @as(i32, vreg) * 8;
+        Enc.pinsrqMem(&self.code, self.alloc, xmm, SCRATCH2, hi_disp, 1);
+    }
+
+    /// Store XMM register to regs[vreg] (lo) + simd_hi[vreg] (hi).
+    fn emitStoreV128(self: *Compiler, xmm: u4, vreg: u16) void {
+        const lo_disp: i32 = @as(i32, vreg) * 8;
+        // MOVQ [REGS_PTR + vreg*8], xmm — stores lo 64 bits
+        Enc.movqXmmToMem(&self.code, self.alloc, REGS_PTR, lo_disp, xmm);
+        // PEXTRQ [SCRATCH2 + hi_off], xmm, 1 — extract and store hi 64 bits
+        self.emitLoadVmPtr(SCRATCH2);
+        const hi_disp: i32 = @as(i32, @intCast(self.simd_hi_offset)) + @as(i32, vreg) * 8;
+        Enc.pextrqMem(&self.code, self.alloc, SCRATCH2, hi_disp, xmm, 1);
+    }
+
+    /// Copy simd_hi[rd] = simd_hi[rs1] (for OP_MOV).
+    fn emitCopySimdHi(self: *Compiler, rd: u16, rs1: u16) void {
+        self.emitLoadVmPtr(SCRATCH2);
+        const src_disp: i32 = @as(i32, @intCast(self.simd_hi_offset)) + @as(i32, rs1) * 8;
+        Enc.loadDisp32(&self.code, self.alloc, SCRATCH, SCRATCH2, src_disp);
+        const dst_disp: i32 = @as(i32, @intCast(self.simd_hi_offset)) + @as(i32, rd) * 8;
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, dst_disp, SCRATCH);
+    }
+
+    /// Clear simd_hi[rd] = 0 (for OP_CONST).
+    fn emitClearSimdHi(self: *Compiler, rd: u16) void {
+        self.emitLoadVmPtr(SCRATCH2);
+        const disp: i32 = @as(i32, @intCast(self.simd_hi_offset)) + @as(i32, rd) * 8;
+        // XOR SCRATCH,SCRATCH then store (avoid MOV imm64)
+        Enc.xorRegReg(&self.code, self.alloc, SCRATCH, SCRATCH);
+        Enc.storeDisp32(&self.code, self.alloc, SCRATCH2, disp, SCRATCH);
+    }
+
+    /// Try to emit native SSE for a SIMD opcode. Returns true if handled.
+    fn emitSimdNative(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) bool {
+        _ = self;
+        _ = instr;
+        _ = ir;
+        _ = pc;
+        // TODO: add native SSE ops incrementally
+        return false;
+    }
+
+    /// Emit SIMD trampoline: spill → set up C ABI args → CALL jitSimdTrampoline → check → reload.
+    fn emitSimdTrampoline(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) void {
+        const sub: u32 = instr.op - predecode_mod.SIMD_BASE;
+        const effect = regalloc_mod.simdStackEffect(sub) orelse return;
+
+        // Check for trailing NOP (extra metadata: lane index, third operand)
+        var extra: u16 = 0;
+        var third_operand: u16 = 0;
+        if (pc.* < ir.len and ir[pc.*].op == regalloc_mod.OP_NOP) {
+            const nop = ir[pc.*];
+            if (effect.pop == 3) {
+                third_operand = nop.rd;
+                extra = nop.rs1;
+            } else {
+                extra = nop.rd;
+            }
+            pc.* += 1;
+        }
+
+        // 1. Spill caller-saved regs
+        self.spillCallerSaved();
+        // Spill SIMD operand vregs (ensure they're in memory for trampoline)
+        if (effect.pop >= 1) self.spillVreg(instr.rs1);
+        if (effect.pop >= 2) self.spillVreg(instr.rs2_field);
+        if (effect.push == 0 and effect.pop == 2) self.spillVreg(instr.rd);
+
+        // 2. Set up C ABI args
+        if (builtin.os.tag == .windows) {
+            // Windows x64: rcx, rdx, r8, r9, stack for rest
+            self.emitLoadVmPtr(.rcx); // arg0: vm_ptr
+            self.emitLoadInstPtr(.rdx); // arg1: instance_ptr
+            Enc.movRegReg(&self.code, self.alloc, .r8, REGS_PTR); // arg2: regs_ptr
+            // arg3: op_extra = opcode | (extra << 32)
+            const op_extra: u64 = @as(u64, instr.op) | (@as(u64, extra) << 32);
+            self.emitLoadImm64(.r9, op_extra);
+            // Stack args (push in reverse order): pool64_len, pool64_ptr, operand, regs_packed
+            // Allocate 32 bytes shadow space + 4*8 = 64 bytes total
+            Enc.subImm32(&self.code, self.alloc, .rsp, 64);
+            // regs_packed at [rsp+32]
+            const regs_packed: u64 = @as(u64, instr.rd) | (@as(u64, instr.rs1) << 16) |
+                (@as(u64, instr.rs2_field) << 32) | (@as(u64, third_operand) << 48);
+            self.emitLoadImm64(SCRATCH, regs_packed);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 32, SCRATCH);
+            // operand at [rsp+40]
+            self.emitLoadImm64(SCRATCH, instr.operand);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 40, SCRATCH);
+            // pool64_ptr at [rsp+48]
+            self.emitLoadImm64(SCRATCH, @intFromPtr(self.pool64.ptr));
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 48, SCRATCH);
+            // pool64_len at [rsp+56]
+            self.emitLoadImm64(SCRATCH, self.pool64.len);
+            Enc.storeDisp32(&self.code, self.alloc, .rsp, 56, SCRATCH);
+        } else {
+            // System V x86_64: rdi, rsi, rdx, rcx, r8, r9, stack for rest
+            self.emitLoadVmPtr(.rdi); // arg0: vm_ptr
+            self.emitLoadInstPtr(.rsi); // arg1: instance_ptr
+            Enc.movRegReg(&self.code, self.alloc, .rdx, REGS_PTR); // arg2: regs_ptr
+            // arg3: op_extra = opcode | (extra << 32)
+            const op_extra: u64 = @as(u64, instr.op) | (@as(u64, extra) << 32);
+            self.emitLoadImm64(.rcx, op_extra);
+            // arg4: regs_packed = rd | (rs1 << 16) | (rs2 << 32) | (third << 48)
+            const regs_packed: u64 = @as(u64, instr.rd) | (@as(u64, instr.rs1) << 16) |
+                (@as(u64, instr.rs2_field) << 32) | (@as(u64, third_operand) << 48);
+            self.emitLoadImm64(.r8, regs_packed);
+            // arg5: operand
+            self.emitLoadImm64(.r9, instr.operand);
+            // Stack args: pool64_ptr, pool64_len (push in reverse)
+            self.emitLoadImm64(SCRATCH, self.pool64.len);
+            Enc.push(&self.code, self.alloc, SCRATCH);
+            self.emitLoadImm64(SCRATCH, @intFromPtr(self.pool64.ptr));
+            Enc.push(&self.code, self.alloc, SCRATCH);
+        }
+
+        // 3. CALL jitSimdTrampoline
+        self.emitLoadImm64(SCRATCH, self.simd_trampoline_addr);
+        Enc.callReg(&self.code, self.alloc, SCRATCH);
+
+        // Clean up stack args
+        if (builtin.os.tag == .windows) {
+            Enc.addImm32(&self.code, self.alloc, .rsp, 64);
+        } else {
+            Enc.addImm32(&self.code, self.alloc, .rsp, 16); // pop 2 stack args
+        }
+
+        // 4. Check error (rax = 0 success, non-zero error)
+        Enc.testRegReg(&self.code, self.alloc, SCRATCH, SCRATCH);
+        self.emitCondError(.ne, 0); // trap with error code from trampoline
+
+        // 5. Reload
+        if (self.has_memory) self.emitLoadMemCache();
+        self.reloadCallerSaved();
+        self.scratch_vreg = null;
+        // Reload result vreg if push=1
+        if (effect.push == 1) {
+            if (vregToPhys(instr.rd)) |phys| {
+                const disp: i32 = @as(i32, instr.rd) * 8;
+                Enc.loadDisp32(&self.code, self.alloc, phys, REGS_PTR, disp);
+            }
+        }
+    }
+
     /// Compile a single RegInstr. Returns false if unsupported (bail out).
     fn compileInstr(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) bool {
         switch (instr.op) {
@@ -3282,10 +3588,15 @@ pub const Compiler = struct {
             regalloc_mod.OP_MOV => {
                 const src = self.getOrLoad(instr.rs1, SCRATCH);
                 self.storeVreg(instr.rd, src);
+                if (self.has_simd) self.emitCopySimdHi(instr.rd, instr.rs1);
             },
-            regalloc_mod.OP_CONST32 => self.emitConst32(instr),
+            regalloc_mod.OP_CONST32 => {
+                self.emitConst32(instr);
+                if (self.has_simd) self.emitClearSimdHi(instr.rd);
+            },
             regalloc_mod.OP_CONST64 => {
                 if (!self.emitConst64(instr)) return false;
+                if (self.has_simd) self.emitClearSimdHi(instr.rd);
             },
 
             // --- Control flow ---
@@ -3595,6 +3906,13 @@ pub const Compiler = struct {
             0xFC04, 0xFC05, // i64.trunc_sat_f32_s/u
             0xFC06, 0xFC07, // i64.trunc_sat_f64_s/u
             => self.emitTruncSat(instr),
+
+            // --- SIMD opcodes: native SSE or trampoline fallback ---
+            predecode_mod.SIMD_BASE...predecode_mod.SIMD_BASE + 0x113 => {
+                if (!self.emitSimdNative(instr, ir, pc)) {
+                    self.emitSimdTrampoline(instr, ir, pc);
+                }
+            },
 
             else => return false, // Unsupported — bail out to interpreter
         }
@@ -4321,6 +4639,8 @@ pub fn compileFunction(
     compiler.use_guard_pages = use_guard_pages;
     compiler.osr_target_pc = osr_target_pc;
     compiler.jit_fuel_offset = @intCast(@offsetOf(vm_mod.Vm, "jit_fuel"));
+    compiler.simd_hi_offset = @intCast(@offsetOf(vm_mod.Vm, "simd_hi"));
+    compiler.simd_trampoline_addr = @intFromPtr(&vm_mod.Vm.jitSimdTrampoline);
     defer compiler.deinit();
 
     return compiler.compile(

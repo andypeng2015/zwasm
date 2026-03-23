@@ -38,9 +38,14 @@ Session handover document. Read at session start.
   - v128.load/store/const, splat, bitwise, demote/promote, f64x2 convert
   - SIMD bench: image_blend 5.2x faster than scalar, matrix_mul 1.4x
   - **Remaining** (~21 ops): shuffle (1), relaxed ops (20) — all trampoline-safe
-  - **Next priorities**:
-    1. x86 SSE port
-    2. Long-term: NEON register allocator or contiguous v128 storage
+- **13.3 x86 SSE port** (in progress, branch `phase13/simd-jit`)
+  - Foundation DONE: simd_hi_offset, has_simd, SSE encoders, emitLoadV128/StoreV128
+  - SIMD trampoline DONE: all SIMD functions JIT-accepted on x86 (trampoline fallback)
+  - OP_MOV/CONST simd_hi handling DONE
+  - Ubuntu x86_64: 62,263/62,263 spec tests pass
+  - Packed SSE encoders added: paddb/w/d/q, psubb/w/d/q, pmullw, pand/por/pxor/pandn, pcmpeq/gt, addps/pd, etc.
+  - **Next**: native SSE ops (v128 load/store → bitwise → arithmetic → float)
+  - **Long-term**: NEON register allocator or contiguous v128 storage
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
 ### Key Design (D130)
