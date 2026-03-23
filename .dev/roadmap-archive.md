@@ -135,3 +135,74 @@ See roadmap.md for current/planned stages.
 
 - Dual entry point, x29 flag, conditional epilogue, callee-saved liveness (D117)
 - **Result**: fib 91→52ms (-43%), matches wasmtime (1.0x)
+
+## Stages 26-47: Spec Conformance, Fuzz, Windows, Production Hardening (COMPLETE)
+
+- Stage 26-31: JIT peephole, platform verification, spec cleanup, GC benchmarks
+- Stage 32: 100% spec conformance (62,263/62,263 on macOS + Linux)
+- Stage 33: Fuzz testing (differential testing, 10K+ corpus, 0 crashes)
+- Stage 34: Windows x86_64 (build, test, JIT, C API, release)
+- Stages 35-41: Production hardening (crash safety, CI/CD, docs, distribution)
+- Stages 42-43: Community preparation, v1.0.0 release
+- Stages 44-47: WAT parser spec parity, SIMD perf analysis, book i18n, WAT roundtrip
+
+## Phase 1: Guard Pages + Module Cache (COMPLETE)
+
+- 1.1 Virtual Memory Guard Pages: mmap/mprotect/signal handler, bounds check elimination
+- 1.2 Module Cache (D124): predecoded IR serialization to `~/.cache/zwasm/<hash>.zwcache`
+- **Gate**: PASSED. v1.3.0.
+
+## Phase 3: CI Automation + Documentation (COMPLETE)
+
+- CI: spec-bump (weekly), wasm-tools-bump (monthly), spectec-monitor (weekly), nightly (weekly)
+- Documentation: ARCHITECTURE.md, data-structures.md, fuzz harness docs
+- D125 decision record
+- **Gate**: PASSED.
+
+## Phase 5: C API + Conditional Compilation (COMPLETE)
+
+- 5.1 C API (D126): 25 exported `zwasm_*` functions, `include/zwasm.h`, `libzwasm`
+- 5.2 Conditional Compilation (D127): `-Djit=false`, `-Dcomponent=false`, `-Dwat=false`
+- Minimal build: ~940KB stripped (24% reduction)
+- **Gate**: PASSED.
+
+## Phase 8: Real-World Coverage + WAT Parity (COMPLETE)
+
+- 50 real-world programs: TinyGo(4) + C(9) + C++(1) + Go(2) + Rust(4) + existing(30)
+- WAT roundtrip: 62,259/62,259 (100%)
+- W30: 5 JIT codegen fixes (guard recovery, instrDefinesRd, callee-saved, x86 emitCall)
+- **Gate**: PASSED.
+
+## Phase 10: Quality / Stabilization (COMPLETE)
+
+- Full test suite re-verification (Mac + Ubuntu), benchmark check, size guard
+- **Gate**: PASSED.
+
+## Phase 11: Allocator Injection + Embedding (COMPLETE, D128)
+
+- CW finalizer, C API config + allocator callback injection
+- `zwasm_config_t` with `set_allocator(alloc_fn, free_fn, ctx)`
+- Embedding docs (Zig/C/Python/Go guide)
+- **Gate**: PASSED. v1.5.0.
+
+## Phase 13: SIMD JIT (COMPLETE, D130)
+
+- ARM64 NEON: 253/256 native (98.8%). x86 SSE: 244/256 native (95.3%).
+- v128 split storage (regs[vreg] lo + simd_hi[vreg] hi)
+- 13.0-13.6: Foundation, load/store, arithmetic, float, compare, convert, shuffle
+- 13.7: 5 real-world C -msimd128 benchmarks, wasmtime comparison
+- Results: image_blend 4.7x, matrix_mul 1.6x (beats wasmtime), byte_search 1.2x
+- **Gate**: PASSED. Merged 2026-03-23.
+
+## Phase 15: Windows Port (COMPLETE, D129)
+
+- VEH signal handler, VirtualAlloc/VirtualProtect, Win64 ABI
+- WASI filesystem Windows branch, CI Windows job + release binaries
+- **Gate**: PASSED. 3-OS CI complete.
+
+## Phase 19: JIT Reliability (COMPLETE)
+
+- 19.1: `force_interpreter` flag, `--interp` CLI
+- 19.2: JIT fuel check at back-edges (ARM64 + x86)
+- 19.3: W35 interpreter OOB fix (emitGlobalSet ABI clobber)
+- **Gate**: PASSED. CI Rust unpinned.
