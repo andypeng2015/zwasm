@@ -10,23 +10,31 @@ Prefix: W## (to distinguish from CW's F## items).
 
 ## Open Items
 
-- [x] W37: SIMD JIT — contiguous v128 storage (DONE)
-  Replaced split storage with contiguous simd_v128[512][2]u64. JIT uses LDR Q/STR Q
-  (ARM64) and MOVDQU (x86) for single-instruction 128-bit access.
-
 - [ ] W38: SIMD JIT — compiler-generated code performance
-  C compiler patterns (wasm_i16x8_make → 8x i16x8.replace_lane) are much slower
-  than hand-written WAT. Scalar gap vs wasmtime on real-world C code is 13-131x
-  (vs 1.2-3.8x on microbenchmarks). Investigate: JIT for WASI C runtime overhead,
-  replace_lane fusion, and SIMD pattern recognition.
+  C compiler (`wasm32-wasi-clang -O2 -msimd128`) patterns are much slower than
+  hand-written WAT. Gap vs wasmtime: microbench 1.2-3.8x, C-generated 13-131x.
 
-- [ ] W39: Multi-value return JIT support (partially done)
-  OP_RETURN_MULTI opcode added, JIT epilogue supports multi-value return.
-  Remaining: RegIR block handling for multi-value arity (if/else/block with
-  type index returning >1 values). Guard `results.len <= 1` still active.
+  **Root cause analysis** (investigate in this order):
+  1. WASI C runtime overhead — large C-compiled wasm includes libc startup.
+     Compare bare function execution time vs full program to isolate.
+  2. replace_lane fusion — `wasm_i16x8_make(a,b,c,...)` generates 8x
+     `i16x8.replace_lane`. Fuse consecutive replace_lane into single v128.const
+     or DUP/INS sequence. Implement in predecode.zig or regalloc.zig peephole.
+  3. Interpreter fallback frequency — C code has large mixed functions (scalar+SIMD).
+     If regalloc bails on any unsupported opcode, entire function falls back.
+     Check bail rate on the 5 C benchmark modules.
+
+  **Key data**: `bench/simd_comparison.yaml` (3 layers: baseline → post-opt → JIT)
+  **Benchmark sources**: `bench/simd/src/` (grayscale.c, box_blur.c, sum_reduce.c,
+  byte_freq.c, nbody_simd.c). Build: `bash bench/simd/build_simd_bench.sh`
+  **Microbench WAT**: `bench/simd/` (dot_product.wat, matrix_mul.wat, etc.)
+  **Run**: `bash bench/run_simd_bench.sh [--quick]`
+  **W37 impact**: v128 load/store is now 1 instruction (was 3-5). Re-measure
+  dot_product (was 0.75x vs scalar, should improve) before deeper optimization.
 
 ## Resolved (summary)
 
-W40: Resolved — epoch-based JIT timeout (D131). JIT fuel check helper replaces jitSuppressed.
+W37: Contiguous v128 storage. W39: Multi-value return JIT (guard removed).
+W40: Epoch-based JIT timeout (D131).
 
 W2-W36: See git history. All resolved through Stages 0-47 and Phases 1-19.

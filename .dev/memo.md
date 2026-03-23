@@ -44,8 +44,10 @@ Session handover document. Read at session start.
 ## References
 
 - `@./.dev/roadmap.md` — Phase roadmap
-- `@./.dev/checklist.md` — W37/W38 open items
-- `@./.dev/decisions.md` — architectural decisions
+- `@./.dev/checklist.md` — W38 details (investigation steps, benchmarks, sources)
+- `@./.dev/decisions.md` — architectural decisions (D131: epoch JIT timeout)
 - `@./.dev/jit-debugging.md` — JIT debug techniques
-- `bench/simd_comparison.yaml` — SIMD JIT benchmark data
+- `bench/simd_comparison.yaml` — SIMD performance data (3 layers: baseline → post-opt → JIT)
+- `bench/simd/src/` — C source for compiler-generated SIMD benchmarks
+- `bench/run_simd_bench.sh` — SIMD microbenchmark runner
 - External: wasmtime (`~/Documents/OSS/wasmtime/`), zware (`~/Documents/OSS/zware/`)
