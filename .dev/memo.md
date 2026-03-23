@@ -42,9 +42,10 @@ Session handover document. Read at session start.
   - Foundation DONE: simd_hi_offset, has_simd, SSE encoders, emitLoadV128/StoreV128
   - SIMD trampoline DONE: all SIMD functions JIT-accepted on x86 (trampoline fallback)
   - OP_MOV/CONST simd_hi handling DONE
+  - **~55 native SSE opcodes**: bitwise (and/andnot/or/xor/not), all int add/sub/mul,
+    all signed int comparisons (eq/ne/lt/le/gt/ge), f32x4/f64x2 arithmetic + sqrt + min/max
   - Ubuntu x86_64: 62,263/62,263 spec tests pass
-  - Packed SSE encoders added: paddb/w/d/q, psubb/w/d/q, pmullw, pand/por/pxor/pandn, pcmpeq/gt, addps/pd, etc.
-  - **Next**: native SSE ops (v128 load/store → bitwise → arithmetic → float)
+  - **Next**: more native SSE (splat, lane ops, extend/narrow, shift, load variants)
   - **Long-term**: NEON register allocator or contiguous v128 storage
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
