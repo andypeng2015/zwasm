@@ -4311,6 +4311,115 @@ pub const Compiler = struct {
                 self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
                 return true;
             },
+            // --- i16x8 arithmetic ---
+            0x8E => { // i16x8.add — ADD V.8H
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field);
+                // ADD Vd.8H, Vn.8H, Vm.8H = 0x4E608400
+                self.emit(0x4E608400 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x91 => { // i16x8.sub — SUB V.8H
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field);
+                // SUB Vd.8H = 0x6E608400
+                self.emit(0x6E608400 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x95 => { // i16x8.mul — MUL V.8H
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field);
+                // MUL Vd.8H, Vn.8H, Vm.8H = 0x4E609C00
+                self.emit(0x4E609C00 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
+            // --- i16x8 extend (unary) ---
+            0x87 => { // i16x8.extend_low_i8x16_s — SXTL V.8H, V.8B
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                // SSHLL Vd.8H, Vn.8B, #0 = 0x0F08A400
+                self.emit(0x0F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x88 => { // i16x8.extend_high_i8x16_s — SSHLL2 V.8H, V.16B, #0
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                // SSHLL2 = 0x4F08A400
+                self.emit(0x4F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x89 => { // i16x8.extend_low_i8x16_u — USHLL V.8H, V.8B, #0
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                // USHLL = 0x2F08A400
+                self.emit(0x2F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x8A => { // i16x8.extend_high_i8x16_u — USHLL2 V.8H, V.16B, #0
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                // USHLL2 = 0x6F08A400
+                self.emit(0x6F08A400 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
+            // --- i8x16 narrow (binary → unary-like: takes 2 v128, produces 1) ---
+            0x65 => { // i8x16.narrow_i16x8_s — SQXTN + SQXTN2
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1); // lower half source
+                self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field); // upper half source
+                // SQXTN Vd.8B, Vn.8H = 0x0E214800
+                self.emit(0x0E214800 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                // SQXTN2 Vd.16B, Vn.8H = 0x4E214800 (appends to upper half)
+                self.emit(0x4E214800 | (@as(u32, SIMD_SCRATCH1) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x66 => { // i8x16.narrow_i16x8_u — SQXTUN + SQXTUN2
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field);
+                // SQXTUN Vd.8B, Vn.8H = 0x2E212800
+                self.emit(0x2E212800 | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                // SQXTUN2 Vd.16B, Vn.8H = 0x6E212800
+                self.emit(0x6E212800 | (@as(u32, SIMD_SCRATCH1) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
+            // --- i16x8 shift ---
+            0x8B => { // i16x8.shl — SSHL (actually SHL by scalar)
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                const shift_reg = self.getOrLoad(instr.rs2_field, SCRATCH);
+                // DUP V1.8H, Wn (broadcast shift amount)
+                self.emit(0x4E020C00 | (@as(u32, shift_reg) << 5) | SIMD_SCRATCH1);
+                // SSHL Vd.8H, Vn.8H, Vm.8H = 0x4E604400
+                self.emit(0x4E604400 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x8C => { // i16x8.shr_s — negate shift amount + SSHL
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                const shift_reg = self.getOrLoad(instr.rs2_field, SCRATCH);
+                self.emit(a64.sub32(SCRATCH, 31, shift_reg)); // negate: 0 - shift (wrap to mod 16)
+                self.emit(0x4E020C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH1);
+                self.emit(0x4E604400 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+            0x8D => { // i16x8.shr_u — negate shift amount + USHL
+                self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
+                const shift_reg = self.getOrLoad(instr.rs2_field, SCRATCH);
+                self.emit(a64.sub32(SCRATCH, 31, shift_reg));
+                self.emit(0x4E020C00 | (@as(u32, SCRATCH) << 5) | SIMD_SCRATCH1);
+                // USHL Vd.8H, Vn.8H, Vm.8H = 0x6E604400
+                self.emit(0x6E604400 | (@as(u32, SIMD_SCRATCH1) << 16) | (@as(u32, SIMD_SCRATCH0) << 5) | SIMD_SCRATCH0);
+                self.emitStoreV128(SIMD_SCRATCH0, instr.rd);
+                return true;
+            },
+
             0x7B => { // i8x16.avgr_u — URHADD V.16B
                 self.emitLoadV128(SIMD_SCRATCH0, instr.rs1);
                 self.emitLoadV128(SIMD_SCRATCH1, instr.rs2_field);

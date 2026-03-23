@@ -30,8 +30,13 @@ Session handover document. Read at session start.
   - SIMD bench: 19-30x slower than scalar (trampoline overhead, was 20-53x)
   - All tests + samples pass. JIT compiles SIMD hot loops.
 - **5 real-world SIMD C samples** in test/realworld/c_simd/ (wasi-sdk -msimd128)
-- **Next**: Replace trampoline with native NEON/SSE for hot SIMD ops (f32x4.add etc.)
-  Then x86 SSE port (D6: both ISAs per group).
+- **13.2+ Native NEON** (in progress): 28 opcodes now native ARM64
+  - f32x4/f64x2 arithmetic, i32x4/i8x16 arithmetic, v128 bitwise
+  - v128.load/store (explicit bounds check), v128.const, splat (all types)
+  - extract_lane (i32x4, f32x4)
+  - Benchmark vs wasmtime: matrix_mul 2.8x, byte_search 3.7x, image_blend 5.6x
+  - Remaining gap (15-17x on dot_product): v128 load-op-store overhead (10 instrs/op)
+  - Next: more opcodes, i16x8 ops, extend/narrow, then x86 SSE port
 - See `@./.dev/roadmap.md` Phase 13 for step breakdown (13.0-13.8)
 
 ### Key Design (D130)
