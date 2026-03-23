@@ -8,25 +8,24 @@ Session handover document. Read at session start.
 - Spec: 62,263/62,263 Mac+Ubuntu+Windows (100.0%, 0 skip).
 - E2E: 792/792 (Mac+Ubuntu). Real-world: 50/50.
 - JIT: Register IR + ARM64/x86_64 + SIMD (NEON 253/256, SSE 244/256).
-- Binary: 1.23MB stripped. Memory: ~3.5MB RSS.
+- Binary: 1.29MB stripped. Memory: ~3.5MB RSS.
 - Platforms: macOS ARM64, Linux x86_64/ARM64, Windows x86_64.
 - **main = stable**. ClojureWasm updated to v1.5.0.
 
 ## Current Task
 
-**Performance & reliability** — Branch `perf/epoch-jit-timeout`.
+**Merged to main** — W40 + W37 + W39 complete.
 
-W40 + W37 complete. JIT now coexists with deadline timeouts (D131) and uses
-contiguous v128 storage for single-instruction SIMD load/store. Next: W39.
+- W40 (D131): Epoch-based JIT timeout — JIT+deadline coexistence
+- W37: Contiguous v128 storage — LDR Q/MOVDQU single-instruction SIMD
+- W39: Multi-value return JIT — OP_RETURN_MULTI, guard removed
 
 ### Open Work Items
 
-| Item     | Description                            |
-|----------|----------------------------------------|
-| ~~W37~~  | Contiguous v128 storage (DONE)          |
-| W38      | Compiler-generated SIMD patterns       |
-| W39      | Multi-value return JIT                 |
-| Phase 18 | Lazy Compilation + CLI Extensions      |
+| Item     | Description                        |
+|----------|------------------------------------|
+| W38      | Compiler-generated SIMD patterns   |
+| Phase 18 | Lazy Compilation + CLI Extensions  |
 
 ## Completed Phases (summary)
 
