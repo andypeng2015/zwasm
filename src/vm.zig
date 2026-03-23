@@ -400,6 +400,11 @@ pub const Vm = struct {
     /// maxInt = unlimited (JIT skips the check entirely when this value is seen).
     jit_fuel: i64 = std.math.maxInt(i64),
 
+    /// v128 upper 64 bits for SIMD in RegIR/JIT. Index = vreg number.
+    /// Lower 64 bits stored in reg_stack[base + vreg].
+    /// Sized for typical SIMD functions (reg_count < 512).
+    simd_hi: [512]u64 = @splat(0),
+
     // Tail call support: when return_call is executed, the callee's func_ptr
     // is stored here and execute() returns normally. doCallDirect() then
     // loops to re-enter the new callee instead of returning.
@@ -4499,8 +4504,8 @@ pub const Vm = struct {
         self.reg_ptr = base + needed;
         defer self.reg_ptr = base;
 
-        // v128 upper halves (SIMD adapter: lo in regs[rd], hi in simd_hi[rd])
-        var simd_hi: [512]u64 = @splat(0);
+        // Reset v128 upper halves for this function (Vm.simd_hi, accessible by JIT)
+        @memset(self.simd_hi[0..@min(reg.reg_count, 512)], 0);
 
         // v128 upper halves (SIMD adapter)
 
@@ -4544,17 +4549,17 @@ pub const Vm = struct {
                 regalloc_mod.OP_MOV => {
                     regs[instr.rd] = regs[instr.rs1];
                     if (instr.rd < 512 and instr.rs1 < 512)
-                        simd_hi[instr.rd] = simd_hi[instr.rs1];
+                        self.simd_hi[instr.rd] = self.simd_hi[instr.rs1];
                 },
 
                 regalloc_mod.OP_CONST32 => {
                     regs[instr.rd] = instr.operand;
-                    if (instr.rd < 512) simd_hi[instr.rd] = 0;
+                    if (instr.rd < 512) self.simd_hi[instr.rd] = 0;
                 },
 
                 regalloc_mod.OP_CONST64 => {
                     regs[instr.rd] = pool64[instr.operand];
-                    if (instr.rd < 512) simd_hi[instr.rd] = 0;
+                    if (instr.rd < 512) self.simd_hi[instr.rd] = 0;
                 },
 
                 // ---- Control flow ----
@@ -5554,7 +5559,7 @@ pub const Vm = struct {
 
                 // ---- SIMD opcodes: adapter to stack interpreter ----
                 predecode_mod.SIMD_BASE...predecode_mod.SIMD_BASE + 0x113 => {
-                    try self.executeSimdViaRegs(instr, regs, &simd_hi, pool64, instance, cached_mem, code, &pc);
+                    try self.executeSimdViaRegs(instr, regs, pool64, instance, cached_mem, code, &pc);
                 },
 
                 // ---- Unreachable ----
@@ -5577,13 +5582,13 @@ pub const Vm = struct {
         self: *Vm,
         instr: regalloc_mod.RegInstr,
         regs: []u64,
-        simd_hi: *[512]u64,
         pool64: []const u64,
         instance: *Instance,
         cached_mem: ?*WasmMemory,
         code: []const regalloc_mod.RegInstr,
         pc_ptr: *u32,
     ) WasmError!void {
+        const simd_hi = &self.simd_hi;
         const sub: u32 = instr.op - predecode_mod.SIMD_BASE;
         const effect = regalloc_mod.simdStackEffect(sub) orelse return error.Trap;
         const saved_op_ptr = self.op_ptr;
@@ -5606,19 +5611,19 @@ pub const Vm = struct {
         // --- Push operands from regs[] to op_stack ---
         if (effect.pop == 3) {
             // bitselect(a, b, c): main rs1=a, rs2=b, NOP.rd=c
-            self.pushRegToOpStack(regs, simd_hi, instr.rs1);
-            self.pushRegToOpStack(regs, simd_hi, instr.rs2_field);
-            self.pushRegToOpStack(regs, simd_hi, third_operand);
+            self.pushRegToOpStack(regs,instr.rs1);
+            self.pushRegToOpStack(regs,instr.rs2_field);
+            self.pushRegToOpStack(regs,third_operand);
         } else if (effect.push == 0 and effect.pop == 2) {
             // Store ops: rd=value, rs1=addr. Stack: [addr(bottom), value(top)]
-            self.pushRegToOpStack(regs, simd_hi, instr.rs1);
-            self.pushRegToOpStack(regs, simd_hi, instr.rd);
+            self.pushRegToOpStack(regs,instr.rs1);
+            self.pushRegToOpStack(regs,instr.rd);
         } else if (effect.pop == 2) {
             // Binary ops: rs1=first, rs2=second. Stack: [first(bottom), second(top)]
-            self.pushRegToOpStack(regs, simd_hi, instr.rs1);
-            self.pushRegToOpStack(regs, simd_hi, instr.rs2_field);
+            self.pushRegToOpStack(regs,instr.rs1);
+            self.pushRegToOpStack(regs,instr.rs2_field);
         } else if (effect.pop == 1) {
-            self.pushRegToOpStack(regs, simd_hi, instr.rs1);
+            self.pushRegToOpStack(regs,instr.rs1);
         }
 
         // --- Call existing SIMD interpreter ---
@@ -5640,10 +5645,10 @@ pub const Vm = struct {
         // defer restores op_ptr
     }
 
-    /// Push value from regs[]/simd_hi[] to op_stack as u128.
-    fn pushRegToOpStack(self: *Vm, regs: []u64, simd_hi: *[512]u64, vreg: u16) void {
+    /// Push value from regs[]/self.simd_hi[] to op_stack as u128.
+    fn pushRegToOpStack(self: *Vm, regs: []u64, vreg: u16) void {
         const lo: u128 = regs[vreg];
-        const hi: u128 = if (vreg < 512) simd_hi[vreg] else 0;
+        const hi: u128 = if (vreg < 512) self.simd_hi[vreg] else 0;
         self.op_stack[self.op_ptr] = lo | (hi << 64);
         self.op_ptr += 1;
     }
