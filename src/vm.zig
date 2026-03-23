@@ -5653,6 +5653,74 @@ pub const Vm = struct {
         self.op_ptr += 1;
     }
 
+    /// SIMD JIT trampoline: called from JIT code to execute a single SIMD instruction.
+    /// Marshals regs[]/simd_hi[] ↔ op_stack, calls executeSimdIR, writes result back.
+    pub fn jitSimdTrampoline(
+        vm_opaque: *anyopaque,
+        instance_opaque: *anyopaque,
+        regs: [*]u64,
+        op_extra: u64,
+        regs_packed: u64,
+        operand: u32,
+        pool64_ptr: [*]const u64,
+        pool64_len: u64,
+    ) callconv(.c) u64 {
+        const self: *Vm = @ptrCast(@alignCast(vm_opaque));
+        const instance: *Instance = @ptrCast(@alignCast(instance_opaque));
+        const simd_op: u16 = @truncate(op_extra);
+        const extra: u16 = @truncate(op_extra >> 32);
+        const rd: u16 = @truncate(regs_packed);
+        const rs1: u16 = @truncate(regs_packed >> 16);
+        const rs2: u16 = @truncate(regs_packed >> 32);
+        const sub = simd_op - predecode_mod.SIMD_BASE;
+        const effect = regalloc_mod.simdStackEffect(sub) orelse return 1;
+        const saved_op_ptr = self.op_ptr;
+        const simd_hi = &self.simd_hi;
+
+        const pushV = struct {
+            fn f(vm: *Vm, r: [*]u64, sh: *[512]u64, vreg: u16) void {
+                const lo: u128 = r[vreg];
+                const hi: u128 = if (vreg < 512) sh[vreg] else 0;
+                vm.op_stack[vm.op_ptr] = lo | (hi << 64);
+                vm.op_ptr += 1;
+            }
+        }.f;
+
+        if (effect.pop == 3) {
+            pushV(self, regs, simd_hi, rs1);
+            pushV(self, regs, simd_hi, rs2);
+            pushV(self, regs, simd_hi, @truncate(regs_packed >> 48));
+        } else if (effect.push == 0 and effect.pop == 2) {
+            pushV(self, regs, simd_hi, rs1);
+            pushV(self, regs, simd_hi, rd);
+        } else if (effect.pop == 2) {
+            pushV(self, regs, simd_hi, rs1);
+            pushV(self, regs, simd_hi, rs2);
+        } else if (effect.pop == 1) {
+            pushV(self, regs, simd_hi, rs1);
+        }
+
+        const pool64 = pool64_ptr[0..@intCast(pool64_len)];
+        const cached_mem: ?*WasmMemory = instance.getMemory(0) catch null;
+
+        self.executeSimdIR(.{
+            .opcode = simd_op,
+            .extra = extra,
+            .operand = operand,
+        }, pool64, instance, cached_mem) catch {
+            self.op_ptr = saved_op_ptr;
+            return 1;
+        };
+
+        if (self.op_ptr > saved_op_ptr) {
+            const val = self.popV128();
+            regs[rd] = @truncate(val);
+            if (rd < 512) simd_hi[rd] = @truncate(val >> 64);
+        }
+        self.op_ptr = saved_op_ptr;
+        return 0;
+    }
+
     // ================================================================
     // Predecoded IR execution
     // ================================================================

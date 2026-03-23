@@ -1011,6 +1011,7 @@ pub const Compiler = struct {
     result_count: u16,
     reg_ptr_offset: u32,
     jit_fuel_offset: u32,
+    simd_hi_offset: u32,
     min_memory_bytes: u32,
     /// Bitmask of vregs that need loading in the prologue.
     /// Bit N = 1 means vreg N is read before written and must be loaded.
@@ -1113,6 +1114,7 @@ pub const Compiler = struct {
             .result_count = 0,
             .reg_ptr_offset = 0,
             .jit_fuel_offset = 0,
+            .simd_hi_offset = 0,
             .min_memory_bytes = 0,
             .prologue_load_mask = 0xFFFFF, // default: load all (20 vregs)
             .known_consts = .{null} ** 128,
@@ -2972,6 +2974,11 @@ pub const Compiler = struct {
             predecode_mod.GC_BASE | 0x04 => self.emitGcSimple(instr, ir, pc.* - 1), // struct.get_u
             predecode_mod.GC_BASE | 0x05 => self.emitGcSimple(instr, ir, pc.* - 1), // struct.set
 
+            // ---- SIMD opcodes: trampoline to interpreter ----
+            predecode_mod.SIMD_BASE...predecode_mod.SIMD_BASE + 0x113 => {
+                self.emitSimdTrampoline(instr, ir, pc);
+            },
+
             // Unsupported opcode — bail out, function can't be JIT compiled
             else => return false,
         }
@@ -4075,6 +4082,88 @@ pub const Compiler = struct {
         self.reloadCallerSavedLive();
         // Reload result register (for get ops and struct.new_default)
         if (sub_op <= 0x04) self.reloadVreg(instr.rd);
+    }
+
+    /// Emit SIMD trampoline call: spill → set up args → BLR → error check → reload.
+    fn emitSimdTrampoline(self: *Compiler, instr: RegInstr, ir: []const RegInstr, pc: *u32) void {
+        const sub = instr.op - predecode_mod.SIMD_BASE;
+        const effect = regalloc_mod.simdStackEffect(sub) orelse return;
+
+        // Check for trailing NOP (extra metadata)
+        var extra: u16 = 0;
+        var third_operand: u16 = 0;
+        if (pc.* < ir.len and ir[pc.*].op == regalloc_mod.OP_NOP) {
+            const nop = ir[pc.*];
+            if (effect.pop == 3) {
+                third_operand = nop.rd;
+                extra = nop.rs1;
+            } else {
+                extra = nop.rd;
+            }
+            pc.* += 1;
+        }
+
+        // 1. Spill all caller-saved regs
+        self.fpCacheEvictAll();
+        self.spillCallerSavedLive(ir, pc.* - 1);
+        // Spill operand vregs
+        if (effect.pop >= 1) self.spillVreg(instr.rs1);
+        if (effect.pop >= 2) self.spillVreg(instr.rs2_field);
+        if (effect.push == 0 and effect.pop == 2) self.spillVreg(instr.rd); // store: rd is value
+
+        // 2. Set up trampoline args (ARM64 C ABI: x0-x7)
+        //    x0 = vm_ptr, x1 = instance_ptr, x2 = regs_ptr
+        self.emitLoadVmPtr(0);
+        self.emitLoadInstPtr(1);
+        self.emit(a64.mov64(2, REGS_PTR));
+
+        //    x3 = opcode | (extra << 32)
+        const op_extra_lo: u16 = @truncate(instr.op);
+        self.emit(a64.movz64(3, op_extra_lo, 0));
+        if (extra != 0) {
+            self.emit(a64.movk64(3, extra, 2)); // bits 32-47
+        }
+
+        //    x4 = rd | (rs1 << 16) | (rs2 << 32) | (third << 48)
+        self.emit(a64.movz64(4, instr.rd, 0));
+        self.emit(a64.movk64(4, instr.rs1, 1));
+        if (effect.pop >= 2) self.emit(a64.movk64(4, instr.rs2_field, 2));
+        if (effect.pop == 3) self.emit(a64.movk64(4, third_operand, 3));
+
+        //    w5 = operand
+        if (instr.operand <= 0xFFFF) {
+            self.emit(a64.movz32(5, @truncate(instr.operand), 0));
+        } else {
+            self.emit(a64.movz32(5, @truncate(instr.operand), 0));
+            self.emit(a64.movk64(5, @truncate(instr.operand >> 16), 1));
+        }
+
+        //    x6 = pool64 ptr, x7 = pool64 len
+        const pool64_instrs = a64.loadImm64(6, @intFromPtr(self.pool64.ptr));
+        for (pool64_instrs) |inst| self.emit(inst);
+        const pool64_len_instrs = a64.loadImm64(7, self.pool64.len);
+        for (pool64_len_instrs) |inst| self.emit(inst);
+
+        // 3. BLR to SIMD trampoline
+        const simd_trampoline_addr = @intFromPtr(&jitSimdTrampoline);
+        const t_instrs = a64.loadImm64(SCRATCH, simd_trampoline_addr);
+        for (t_instrs) |inst| self.emit(inst);
+        self.emit(a64.blr(SCRATCH));
+
+        // 4. Error check (x0 = 0 success, 1 error)
+        const error_branch = self.currentIdx();
+        self.emit(a64.cbnz64(0, 0));
+        self.error_stubs.append(self.alloc, .{
+            .branch_idx = error_branch,
+            .error_code = 0,
+            .kind = .cbnz64,
+            .cond = .eq,
+        }) catch {};
+
+        // 5. Reload
+        if (self.has_memory) self.emitLoadMemCache();
+        self.reloadCallerSavedLive();
+        if (effect.push == 1) self.reloadVreg(instr.rd);
     }
 
     /// Inline self-call: direct BL to function entry, bypassing trampoline.
@@ -5297,6 +5386,9 @@ pub fn jitMemCopy(instance_opaque: *anyopaque, dst: u32, src: u32, n: u32) callc
     return 0;
 }
 
+// SIMD trampoline is in vm.zig (needs access to Vm internals)
+const jitSimdTrampoline = vm_mod.Vm.jitSimdTrampoline;
+
 // ================================================================
 // Public API
 // ================================================================
@@ -5356,6 +5448,7 @@ pub fn compileFunction(
     compiler.osr_target_pc = osr_target_pc;
     compiler.gc_trampoline_addr = gc_trampoline_addr;
     compiler.jit_fuel_offset = @intCast(@offsetOf(vm_mod.Vm, "jit_fuel"));
+    compiler.simd_hi_offset = @intCast(@offsetOf(vm_mod.Vm, "simd_hi"));
 
     // Dump JIT code before deinit (pc_map still alive, one-shot)
     if (trace) |tc| {
