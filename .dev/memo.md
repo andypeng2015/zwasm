@@ -14,38 +14,32 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-**W38 Lazy AOT — in progress** on branch `perf/w38-lazy-aot`.
+**W38 Lazy AOT — merge gate** on branch `perf/w38-lazy-aot`.
 
-### Done
+### Changes
 
 - HOT_THRESHOLD 10 → 3: earlier JIT compilation
-- Back-edge `jit_failed` poisoning fix: `back_edge_bailed` separate flag
-  so reentry guard/br_table bail doesn't block call-path JIT
-- ARM64 extract_lane encoding fix: imm5 shift + upper-half memory load
-- Added ldr32/ldrb/ldrsb32/ldrh/ldrsh32 ARM64 helpers
+- `back_edge_bailed` flag: reentry guard/br_table bail separated from `jit_failed`
+- ARM64 extract_lane: imm5 shift fix + upper-half lane memory load
+- JIT `jitMemGrow`: u32 → u64 for memory64 `-1` return
+- JIT trampoline: cross-module call passes callee's instance (not caller's)
 - Tests: force_interpreter for fuel/deadline/memory resource tests
 
-### Status
+### Gate Status
 
 - `zig build test`: all pass
-- Spec: 62,258/62,263 (5 pre-existing JIT bugs in linking/memory_grow64)
-- E2E: 792/792. Real-world: 49/50 (rust_compression pre-existing)
+- Spec: **62,263/62,263 (100%)**
+- E2E: 792/792
+- Real-world: 41/50 (6 JIT bugs → W41, 3 wasmtime diffs → W42)
 - Benchmarks: no regression
-
-### Next Steps
-
-1. Run SIMD benchmarks to measure W38 perf improvement
-2. Investigate 5 spec failures (linking: 3, memory_grow64: 2)
-3. Run Merge Gate (Ubuntu) if merging
 
 ### Open Work Items
 
-| Item     | Description                                      | Status           |
-|----------|--------------------------------------------------|------------------|
-| W38      | C-compiled SIMD perf (threshold + back-edge fix) | Implementation   |
-| W39      | JIT bugs: linking(3), memory_grow64(2) at T=3    | New              |
-| W40      | JIT SIMD: stack-allocated Vm simd_v128 access     | New              |
-| Phase 18 | Lazy Compilation + CLI Extensions                | Aligns with W38  |
+| Item     | Description                                       | Status         |
+|----------|---------------------------------------------------|----------------|
+| W41      | JIT real-world correctness (6 programs, T=3 露出)  | New            |
+| W42      | wasmtime 互換性差異 (3 Go programs, JIT 無関係)     | New            |
+| Phase 18 | Lazy Compilation + CLI Extensions                 | Future         |
 
 ## Completed Phases (summary)
 
