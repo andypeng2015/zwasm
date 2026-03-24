@@ -2491,9 +2491,21 @@ pub const Compiler = struct {
             }
         }
 
-        // Mark params as written (they're initialized by the caller)
+        // Pre-scan: compute written_vregs for the ENTIRE function.
+        // This must cover all instructions, not just those before each call site,
+        // because loops can write a vreg AFTER a call that needs to spill it.
+        // Without the full pre-scan, the spill optimization incorrectly skips
+        // vregs that are written later in the loop body (bug: stale reload).
         for (0..self.param_count) |i| {
             if (i < 128) self.written_vregs |= @as(u128, 1) << @as(u7, @intCast(i));
+        }
+        for (ir) |scan_instr| {
+            if (scan_instr.rd < 128) {
+                const op = scan_instr.op;
+                if (!self.isControlFlowOp(op) or op == regalloc_mod.OP_CALL or op == regalloc_mod.OP_CALL_INDIRECT) {
+                    self.written_vregs |= @as(u128, 1) << @as(u7, @intCast(scan_instr.rd));
+                }
+            }
         }
 
         while (pc < ir.len) {
@@ -2527,14 +2539,7 @@ pub const Compiler = struct {
                 // Non-const write to rd invalidates that vreg's known const
                 self.known_consts[instr.rd] = null;
             }
-            // Track written vregs for spill optimization
-            // Include CALL/CALL_INDIRECT results — they write to rd and must be spilled
-            if (instr.rd < 128) {
-                const op = instr.op;
-                if (!self.isControlFlowOp(op) or op == regalloc_mod.OP_CALL or op == regalloc_mod.OP_CALL_INDIRECT) {
-                    self.written_vregs |= @as(u128, 1) << @as(u7, @intCast(instr.rd));
-                }
-            }
+            // written_vregs already computed in pre-scan (covers full function for loops)
         }
         // Trailing entry for end-of-function
         self.pc_map.items[ir.len] = self.currentIdx();
@@ -3954,7 +3959,7 @@ pub const Compiler = struct {
     fn emitCall(self: *Compiler, rd: u16, func_idx: u32, n_args: u16, n_results: u16, data: RegInstr, data2: ?RegInstr, ir: []const RegInstr, call_pc: u32) void {
         // Self-call: use lightweight inline path with call_depth guard
         if (func_idx == self.self_func_idx) {
-            self.emitInlineSelfCall(rd, data, data2, ir, call_pc);
+            self.emitInlineSelfCall(rd, n_results, data, data2, ir, call_pc);
             return;
         }
 
@@ -5941,7 +5946,7 @@ pub const Compiler = struct {
     /// Manages reg_ptr and callee frame setup inline for maximum performance.
     /// Non-memory functions use cached REG_PTR_VAL (x27) holding the actual value.
     /// Memory functions recompute &vm.reg_ptr into SCRATCH each time.
-    fn emitInlineSelfCall(self: *Compiler, rd: u16, data: RegInstr, data2: ?RegInstr, ir: []const RegInstr, call_pc: u32) void {
+    fn emitInlineSelfCall(self: *Compiler, rd: u16, n_results: u16, data: RegInstr, data2: ?RegInstr, ir: []const RegInstr, call_pc: u32) void {
         const needed: u32 = @as(u32, self.reg_count) + 4;
         const needed_bytes: u32 = needed * 8;
 
@@ -5966,7 +5971,7 @@ pub const Compiler = struct {
         self.fpCacheEvictAll(); // Write back D-cache before BL clobbers D-regs
         // Callee-saved spill: lightweight self-call skips STP x19-x28 in callee,
         // so caller must save live callee-saved vregs to regs[] explicitly.
-        const callee_exclude: ?u16 = if (self.result_count > 0 and self.isCalleeSavedVreg(rd)) rd else null;
+        const callee_exclude: ?u16 = if (n_results > 0 and self.isCalleeSavedVreg(rd)) rd else null;
         self.spillCalleeSavedLive(ir, call_pc, callee_exclude);
         self.spillCallerSavedLive(ir, call_pc);
 
@@ -6144,11 +6149,13 @@ pub const Compiler = struct {
         //     emitLoadMemCache calls jitGetMemInfo via BLR which clobbers all caller-saved
         //     registers (x0-x7, x9-x15). Must reload memory cache BEFORE caller-saved regs,
         //     matching the same ordering as emitCall (step 5a there).
-        const rd_phys = if (self.result_count > 0) vregToPhys(rd) else null;
+        // Use the actual call's n_results (not self.result_count) — void calls
+        // must NOT load the callee's result into rd, which would corrupt a live vreg.
+        const rd_phys = if (n_results > 0) vregToPhys(rd) else null;
         const rd_callee_saved = if (rd_phys) |p| (p >= 19 and p <= 28) else false;
 
         // 11a. Callee-saved result: load before BLR (survives BLR since callee-saved).
-        if (self.result_count > 0 and rd_callee_saved) {
+        if (n_results > 0 and rd_callee_saved) {
             self.emitLoadCalleeResult(rd_phys.?, needed_bytes);
         }
 
@@ -6160,7 +6167,7 @@ pub const Compiler = struct {
         // 13. Reload caller-saved regs AFTER all BLRs, then caller-saved result last.
         self.reloadCallerSavedLiveExcept(if (rd_phys != null and !rd_callee_saved) rd else null);
 
-        if (self.result_count > 0 and !rd_callee_saved) {
+        if (n_results > 0 and !rd_callee_saved) {
             if (rd_phys) |phys| {
                 self.emitLoadCalleeResult(phys, needed_bytes);
             } else {
