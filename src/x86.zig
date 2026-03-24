@@ -342,6 +342,14 @@ const Enc = struct {
         buf.append(alloc, @bitCast(imm)) catch {};
     }
 
+    /// CMP r/m32, imm8 (sign-extended to 32 bits)
+    fn cmpImm8_32(buf: *std.ArrayList(u8), alloc: Allocator, reg: Reg, imm: i8) void {
+        if (reg.isExt()) buf.append(alloc, rex(false, false, false, true)) catch {};
+        buf.append(alloc, 0x83) catch {};
+        buf.append(alloc, modrm(0b11, 7, reg.low3())) catch {};
+        buf.append(alloc, @bitCast(imm)) catch {};
+    }
+
     /// TEST r64, r64 (3 bytes): REX.W 85 /r
     fn testRegReg(buf: *std.ArrayList(u8), alloc: Allocator, a: Reg, b: Reg) void {
         buf.append(alloc, rexW(b, a)) catch {};
@@ -6536,17 +6544,19 @@ pub const Compiler = struct {
         // Signed division edge cases for divisor == -1:
         // - div: INT_MIN / -1 → IntegerOverflow trap (x86 IDIV raises SIGFPE)
         // - rem: N % -1 = 0 always; skip IDIV to avoid SIGFPE on INT_MIN
+        // Use 32-bit CMP: i32(-1) is stored as 0x00000000FFFFFFFF in 64-bit reg,
+        // so 64-bit CMP with sign-extended -1 (0xFFFFFFFFFFFFFFFF) would fail.
         var rem_done_off: ?u32 = null;
         if (signed) {
             if (!is_rem) {
-                Enc.cmpImm8(&self.code, self.alloc, divisor, -1);
+                Enc.cmpImm8_32(&self.code, self.alloc, divisor, -1);
                 const skip_off = Enc.jccRel32(&self.code, self.alloc, .ne);
                 Enc.cmpImm32(&self.code, self.alloc, r1, 0x80000000);
                 self.emitCondError(.e, 4); // error code 4 = IntegerOverflow
                 Enc.patchRel32(self.code.items, skip_off, self.currentOffset());
             } else {
                 // rem_s: if divisor == -1, result is 0 — skip IDIV entirely
-                Enc.cmpImm8(&self.code, self.alloc, divisor, -1);
+                Enc.cmpImm8_32(&self.code, self.alloc, divisor, -1);
                 const ne_off = Enc.jccRel32(&self.code, self.alloc, .ne);
                 Enc.xorRegReg32(&self.code, self.alloc, .rax, .rax);
                 self.storeVreg(instr.rd, .rax);
