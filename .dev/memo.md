@@ -63,14 +63,31 @@ Verified NOT the cause:
 - spillCallerSavedLive liveness analysis (tested with conservative spill, still crashes)
 - Memory.fill arguments (fixed, but func#154's memory.fill args don't alias ABI regs)
 
+### Critical finding: Register file corruption
+
+Tracing the func#124 (interfaceTypeAssert) call from func#154 shows:
+- `regs[6]` = 0x10740A418 (a NATIVE POINTER, not a wasm i32!)
+- This is the mem_base value from jitGetMemInfo
+- For reg_count=12: mem_base is stored at regs[12], NOT regs[6]
+- But somehow the native pointer ends up in regs[6]
+
+Hypothesis: After emitCall → emitLoadMemCache → BLR jitGetMemInfo,
+the reloadCallerSavedLive loads x10 (r6) from regs[6]. If regs[6] was
+corrupted between the spill and the reload (e.g., by the callee writing
+to the wrong location), x10 gets the wrong value.
+
+Note: vm.zig has THREE JIT compilation paths (line 699, 4461, 7075).
+All three must be checked/guarded consistently.
+
 ### Approach (next session)
 
-1. Focus on func#154 (12 regs, simplest crash case):
-   - Add memory write trace: compare JIT vs interpreter store addresses/values
-   - Check if store offsets in emitMemStore match WAT offsets
-   - Verify `isConstAddrSafe` fast path correctness
-2. Alternative: write a WAT module that mimics func#154's structure and test
-3. Consider: is there a bug in the back-edge JIT path for func#97?
+1. Add JIT-level instrumentation: emit a call to a debug function after
+   each emitLoadMemCache to verify regs[6] == 0 (expected for func#154)
+2. Check if the trampoline fast path callee writes beyond its allocated
+   register frame (off-by-one in `needed` calculation)
+3. Check if jitGetMemInfo writes beyond regs[12..13] (verify the `out`
+   pointer and write count)
+4. Run with ASAN/MSAN if possible
 
 ### Open Work Items
 
