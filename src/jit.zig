@@ -1061,6 +1061,8 @@ pub const Compiler = struct {
     error_stubs: std.ArrayList(ErrorStub),
     /// Branch indices from fuel checks — all patched to a single shared fuel exit.
     fuel_check_branches: std.ArrayList(u32),
+    /// Out-of-line flush stubs for conditional branches within SIMD loops.
+    flush_stubs: std.ArrayList(FlushStub),
     alloc: Allocator,
     reg_count: u16,
     local_count: u16,
@@ -1155,6 +1157,10 @@ pub const Compiler = struct {
     /// IR slice and branch targets for peephole fusion (set during compile).
     ir_slice: []const RegInstr = &.{},
     branch_targets_slice: []bool = &.{},
+    /// Loop header markers: true for PCs that are targets of backward branches.
+    loop_headers_slice: []bool = &.{},
+    /// For each loop header PC, the max back-edge source PC (defines loop body range).
+    loop_end_map: []u32 = &.{},
 
     const FastPathInfo = struct {
         param_offset: u16,
@@ -1179,6 +1185,16 @@ pub const Compiler = struct {
         cond: a64.Cond, // only used for b_cond_inverted
     };
 
+    /// Out-of-line flush stub for conditional branches within SIMD loops.
+    /// The branch jumps to this stub which flushes dirty Q-regs then jumps to the target.
+    /// This keeps the hot fall-through path (loop continuation) flush-free.
+    const FlushStub = struct {
+        branch_idx: u32, // index of CBNZ/CBZ placeholder
+        target_pc: u32, // actual branch target PC
+        kind: PatchKind, // cbz32 or cbnz32
+        dirty: [SIMD_QREG_COUNT]?u16, // snapshot of dirty Q-reg→vreg mapping
+    };
+
     pub fn init(alloc: Allocator) Compiler {
         return .{
             .code = .empty,
@@ -1186,6 +1202,7 @@ pub const Compiler = struct {
             .patches = .empty,
             .error_stubs = .empty,
             .fuel_check_branches = .empty,
+            .flush_stubs = .empty,
             .alloc = alloc,
             .reg_count = 0,
             .local_count = 0,
@@ -1245,6 +1262,7 @@ pub const Compiler = struct {
         self.patches.deinit(self.alloc);
         self.error_stubs.deinit(self.alloc);
         self.fuel_check_branches.deinit(self.alloc);
+        self.flush_stubs.deinit(self.alloc);
     }
 
     /// Effective max physical registers: 22 when SIMD base is cached (x17 reserved), else 23.
@@ -2414,39 +2432,73 @@ pub const Compiler = struct {
     }
 
     /// Pre-scan IR to find all branch targets (PCs that can be jumped to).
+    /// Also populates loop_headers_slice and loop_end_map for SIMD loop persistence.
     fn scanBranchTargets(self: *Compiler, ir: []const RegInstr) ?[]bool {
         const targets = self.alloc.alloc(bool, ir.len) catch return null;
         @memset(targets, false);
+        const loop_headers = self.alloc.alloc(bool, ir.len) catch {
+            self.alloc.free(targets);
+            return null;
+        };
+        @memset(loop_headers, false);
+        const loop_end = self.alloc.alloc(u32, ir.len) catch {
+            self.alloc.free(loop_headers);
+            self.alloc.free(targets);
+            return null;
+        };
+        @memset(loop_end, 0);
+
         var scan_pc: u32 = 0;
         while (scan_pc < ir.len) {
             const instr = ir[scan_pc];
+            const source_pc = scan_pc;
             scan_pc += 1;
             switch (instr.op) {
                 regalloc_mod.OP_BR => {
-                    // operand = target PC
-                    if (instr.operand < ir.len) targets[instr.operand] = true;
+                    if (instr.operand < ir.len) {
+                        targets[instr.operand] = true;
+                        // Back-edge: target < source → loop header
+                        if (instr.operand <= source_pc) {
+                            loop_headers[instr.operand] = true;
+                            if (source_pc > loop_end[instr.operand])
+                                loop_end[instr.operand] = source_pc;
+                        }
+                    }
                 },
                 regalloc_mod.OP_BR_IF, regalloc_mod.OP_BR_IF_NOT => {
-                    // operand = target PC
-                    if (instr.operand < ir.len) targets[instr.operand] = true;
+                    if (instr.operand < ir.len) {
+                        targets[instr.operand] = true;
+                        if (instr.operand <= source_pc) {
+                            loop_headers[instr.operand] = true;
+                            if (source_pc > loop_end[instr.operand])
+                                loop_end[instr.operand] = source_pc;
+                        }
+                    }
                 },
                 regalloc_mod.OP_BR_TABLE => {
-                    // Next N+1 entries are NOP placeholders with targets in operand
                     const count = instr.operand;
                     var i: u32 = 0;
                     while (i < count + 1 and scan_pc < ir.len) : (i += 1) {
                         const entry = ir[scan_pc];
                         scan_pc += 1;
-                        if (entry.operand < ir.len) targets[entry.operand] = true;
+                        if (entry.operand < ir.len) {
+                            targets[entry.operand] = true;
+                            if (entry.operand <= source_pc) {
+                                loop_headers[entry.operand] = true;
+                                if (source_pc > loop_end[entry.operand])
+                                    loop_end[entry.operand] = source_pc;
+                            }
+                        }
                     }
                 },
                 regalloc_mod.OP_BLOCK_END => {
-                    // Block end is a merge point
                     targets[scan_pc - 1] = true;
                 },
                 else => {},
             }
         }
+        self.loop_headers_slice = loop_headers;
+        self.loop_end_map = loop_end;
         return targets;
     }
 
@@ -2557,6 +2609,8 @@ pub const Compiler = struct {
         // Pre-scan: find branch targets for known_consts invalidation
         const branch_targets = self.scanBranchTargets(ir) orelse return null;
         defer self.alloc.free(branch_targets);
+        defer self.alloc.free(self.loop_headers_slice);
+        defer self.alloc.free(self.loop_end_map);
 
         // Store IR and branch targets for peephole fusion
         self.ir_slice = ir;
@@ -2604,10 +2658,17 @@ pub const Compiler = struct {
             if (pc < branch_targets.len and branch_targets[pc]) {
                 self.known_consts = .{null} ** 128;
                 self.scratch_vreg = null;
-                self.evictAllCaches();
+                if (pc < self.loop_headers_slice.len and self.loop_headers_slice[pc]) {
+                    // Loop header: emit pre-loads BEFORE pc_map (first iteration only),
+                    // then keep Q-reg cache alive. Back-edges jump to pc_map (after pre-loads).
+                    self.fpCacheEvictAll();
+                    self.emitLoopPreHeader(ir, pc);
+                } else {
+                    self.evictAllCaches();
+                }
             }
 
-            // Record ARM64 code offset AFTER eviction — branches jump here.
+            // Record ARM64 code offset AFTER eviction/pre-header — branches jump here.
             self.pc_map.items[pc] = self.currentIdx();
 
             pc += 1;
@@ -2621,7 +2682,13 @@ pub const Compiler = struct {
                 // After branches/calls, clear all — next basic block starts fresh
                 self.known_consts = .{null} ** 128;
                 self.scratch_vreg = null;
-                self.evictAllCaches();
+                if (instr.op == regalloc_mod.OP_BR_IF or instr.op == regalloc_mod.OP_BR_IF_NOT) {
+                    // Conditional branches: Q-reg cache stays for fall-through path.
+                    // FP cache was already evicted in the handler. Evict remaining.
+                    self.fpCacheEvictAll();
+                } else {
+                    self.evictAllCaches();
+                }
             } else if (instr.rd < 128) {
                 // Non-const write to rd invalidates that vreg's known const
                 self.known_consts[instr.rd] = null;
@@ -2633,6 +2700,9 @@ pub const Compiler = struct {
 
         // Emit error stubs (after all code including epilogue, before patching)
         self.emitErrorStubs();
+
+        // Emit out-of-line flush stubs for SIMD loop conditional branches
+        self.emitFlushStubs();
 
         // Patch forward branches
         self.patchBranches() catch return null;
@@ -2702,10 +2772,17 @@ pub const Compiler = struct {
 
             // --- Control flow ---
             regalloc_mod.OP_BR => {
-                self.evictAllCaches();
                 const target = instr.operand;
+                const is_back_edge = target <= pc.* - 1;
+                if (is_back_edge and target < self.loop_headers_slice.len and self.loop_headers_slice[target]) {
+                    // Back-edge to loop header: flush Q-regs (keep cache) for deopt safety
+                    self.fpCacheEvictAll();
+                    self.simdQregFlushAll();
+                } else {
+                    self.evictAllCaches();
+                }
                 // Fuel check at back-edges (target <= current pc)
-                if (target <= pc.* - 1) self.emitFuelCheck();
+                if (is_back_edge) self.emitFuelCheck();
                 const arm_idx = self.currentIdx();
                 self.emit(a64.b(0)); // placeholder
                 self.patches.append(self.alloc, .{
@@ -2715,31 +2792,71 @@ pub const Compiler = struct {
                 }) catch return false;
             },
             regalloc_mod.OP_BR_IF => {
-                self.evictAllCaches();
-                // Fuel check at back-edges (before the conditional branch)
-                if (instr.operand <= pc.* - 1) self.emitFuelCheck();
-                // Branch if rd != 0
-                const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
-                const arm_idx = self.currentIdx();
-                self.emit(a64.cbnz32(cond_reg, 0)); // placeholder
-                self.patches.append(self.alloc, .{
-                    .arm64_idx = arm_idx,
-                    .target_pc = instr.operand,
-                    .kind = .cbnz32,
-                }) catch return false;
+                const is_back_edge = instr.operand <= pc.* - 1;
+                if (is_back_edge) {
+                    // Back-edge conditional: flush inline (needed for fuel check deopt safety)
+                    self.fpCacheEvictAll();
+                    self.simdQregFlushAll();
+                    self.emitFuelCheck();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbnz32(cond_reg, 0)); // placeholder
+                    self.patches.append(self.alloc, .{
+                        .arm64_idx = arm_idx,
+                        .target_pc = instr.operand,
+                        .kind = .cbnz32,
+                    }) catch return false;
+                } else if (self.hasAnyCachedSimd()) {
+                    // Forward conditional with cached Q-regs: out-of-line flush stub.
+                    // Fall-through (loop continuation) has zero flush overhead.
+                    self.fpCacheEvictAll();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbnz32(cond_reg, 0)); // placeholder → flush stub
+                    self.emitFlushStub(arm_idx, instr.operand, .cbnz32);
+                } else {
+                    self.evictAllCaches();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbnz32(cond_reg, 0)); // placeholder
+                    self.patches.append(self.alloc, .{
+                        .arm64_idx = arm_idx,
+                        .target_pc = instr.operand,
+                        .kind = .cbnz32,
+                    }) catch return false;
+                }
             },
             regalloc_mod.OP_BR_IF_NOT => {
-                self.evictAllCaches();
-                // Fuel check at back-edges
-                if (instr.operand <= pc.* - 1) self.emitFuelCheck();
-                const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
-                const arm_idx = self.currentIdx();
-                self.emit(a64.cbz32(cond_reg, 0)); // placeholder
-                self.patches.append(self.alloc, .{
-                    .arm64_idx = arm_idx,
-                    .target_pc = instr.operand,
-                    .kind = .cbz32,
-                }) catch return false;
+                const is_back_edge = instr.operand <= pc.* - 1;
+                if (is_back_edge) {
+                    self.fpCacheEvictAll();
+                    self.simdQregFlushAll();
+                    self.emitFuelCheck();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbz32(cond_reg, 0)); // placeholder
+                    self.patches.append(self.alloc, .{
+                        .arm64_idx = arm_idx,
+                        .target_pc = instr.operand,
+                        .kind = .cbz32,
+                    }) catch return false;
+                } else if (self.hasAnyCachedSimd()) {
+                    self.fpCacheEvictAll();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbz32(cond_reg, 0)); // placeholder → flush stub
+                    self.emitFlushStub(arm_idx, instr.operand, .cbz32);
+                } else {
+                    self.evictAllCaches();
+                    const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
+                    const arm_idx = self.currentIdx();
+                    self.emit(a64.cbz32(cond_reg, 0)); // placeholder
+                    self.patches.append(self.alloc, .{
+                        .arm64_idx = arm_idx,
+                        .target_pc = instr.operand,
+                        .kind = .cbz32,
+                    }) catch return false;
+                }
             },
             regalloc_mod.OP_RETURN => {
                 self.evictAllCaches();
@@ -4411,6 +4528,108 @@ pub const Compiler = struct {
         for (0..SIMD_QREG_COUNT) |i| {
             self.simdQregEvictSlot(i);
         }
+    }
+
+    /// Flush all dirty Q-reg cache entries to simd_v128[] WITHOUT invalidating.
+    /// After flush, entries remain cached but marked clean (memory is up-to-date).
+    /// Used at loop back-edges and headers to keep Q-regs alive across iterations.
+    fn simdQregFlushAll(self: *Compiler) void {
+        for (0..SIMD_QREG_COUNT) |i| {
+            if (self.simd_qreg[i]) |vreg| {
+                if (self.simd_qreg_dirty[i]) {
+                    const qreg: u5 = @intCast(@as(u6, SIMD_QREG_BASE) + @as(u6, @intCast(i)));
+                    self.emitStoreV128Raw(qreg, vreg);
+                    self.simd_qreg_dirty[i] = false;
+                }
+            }
+        }
+    }
+
+    /// Check if any Q-reg cache slots are occupied (dirty or clean).
+    fn hasAnyCachedSimd(self: *const Compiler) bool {
+        for (self.simd_qreg) |entry| {
+            if (entry != null) return true;
+        }
+        return false;
+    }
+
+    /// Snapshot current dirty Q-reg state and record an out-of-line flush stub.
+    /// The branch will be patched to jump to the stub at function end.
+    fn emitFlushStub(self: *Compiler, branch_idx: u32, target_pc: u32, kind: PatchKind) void {
+        var dirty: [SIMD_QREG_COUNT]?u16 = .{null} ** SIMD_QREG_COUNT;
+        for (0..SIMD_QREG_COUNT) |i| {
+            if (self.simd_qreg[i] != null and self.simd_qreg_dirty[i]) {
+                dirty[i] = self.simd_qreg[i];
+            }
+        }
+        self.flush_stubs.append(self.alloc, .{
+            .branch_idx = branch_idx,
+            .target_pc = target_pc,
+            .kind = kind,
+            .dirty = dirty,
+        }) catch {};
+    }
+
+    /// Emit loop pre-header: load v128 input vregs into Q-regs before the loop header.
+    /// Called BEFORE recording pc_map so back-edges skip pre-loads (only first iteration loads).
+    /// Sets up Q-reg cache entries so the loop body finds inputs already cached.
+    fn emitLoopPreHeader(self: *Compiler, ir: []const RegInstr, header_pc: u32) void {
+        const end_pc = if (header_pc < self.loop_end_map.len) self.loop_end_map[header_pc] else return;
+        if (end_pc == 0) return;
+
+        // Scan loop body to find v128 vregs that are read (as SIMD op inputs)
+        // before being written. These need pre-loading for the first iteration.
+        var written = [_]bool{false} ** 128; // track which vregs have been written
+        var n_inputs: usize = 0;
+        var inputs: [SIMD_QREG_COUNT]u16 = undefined;
+
+        var scan_pc = header_pc;
+        while (scan_pc <= end_pc and scan_pc < ir.len) : (scan_pc += 1) {
+            const instr = ir[scan_pc];
+            const op = instr.op;
+
+            if (op >= predecode_mod.SIMD_BASE and op <= predecode_mod.SIMD_BASE + 0x113) {
+                const sub = op - predecode_mod.SIMD_BASE;
+
+                // Check rs1 as v128 input (if it's a known v128 vreg)
+                if (instr.rs1 < 128 and (self.v128_vregs & (@as(u128, 1) << @as(u7, @intCast(instr.rs1)))) != 0) {
+                    if (!written[instr.rs1]) {
+                        self.addLoopInput(&inputs, &n_inputs, instr.rs1);
+                    }
+                }
+                // Check rs2 as v128 input
+                if (instr.rs2_field < 128 and (self.v128_vregs & (@as(u128, 1) << @as(u7, @intCast(instr.rs2_field)))) != 0) {
+                    if (!written[instr.rs2_field]) {
+                        self.addLoopInput(&inputs, &n_inputs, instr.rs2_field);
+                    }
+                }
+                // Mark rd as written if it produces v128
+                if (predecode_mod.simdResultIsV128(sub) and instr.rd < 128) {
+                    written[instr.rd] = true;
+                }
+            }
+        }
+
+        if (n_inputs == 0) return;
+
+        // Emit pre-loads and set up Q-reg cache
+        self.simdQregEvictAll(); // clear any stale cache from before the loop
+        for (0..n_inputs) |i| {
+            const vreg = inputs[i];
+            self.simd_qreg[i] = vreg;
+            self.simd_qreg_dirty[i] = false;
+            const qreg: u5 = @intCast(@as(u6, SIMD_QREG_BASE) + @as(u6, @intCast(i)));
+            self.emitLoadV128Raw(qreg, vreg);
+        }
+    }
+
+    fn addLoopInput(_: *Compiler, inputs: *[SIMD_QREG_COUNT]u16, n: *usize, vreg: u16) void {
+        if (n.* >= SIMD_QREG_COUNT) return;
+        for (inputs.*[0..n.*]) |existing| {
+            if (existing == vreg) return; // already added
+        }
+        inputs.*[n.*] = vreg;
+        n.* += 1;
     }
 
     /// Flush a specific vreg from Q cache to simd_v128[] if dirty, keeping cache entry valid.
@@ -7007,6 +7226,49 @@ pub const Compiler = struct {
                 const offset: i32 = @as(i32, @intCast(fuel_stub_idx)) - @as(i32, @intCast(bl_idx));
                 const imm: u26 = @bitCast(@as(i26, @intCast(offset)));
                 self.code.items[bl_idx] = 0x94000000 | @as(u32, imm); // BL imm26
+            }
+        }
+    }
+
+    /// Emit out-of-line flush stubs for conditional branches within SIMD loops.
+    /// Each stub: STR dirty Q-regs → B target. The original branch is patched to the stub.
+    fn emitFlushStubs(self: *Compiler) void {
+        for (self.flush_stubs.items) |stub| {
+            const stub_idx = self.currentIdx();
+
+            // Emit STR for each dirty Q-reg captured at branch time
+            for (0..SIMD_QREG_COUNT) |i| {
+                if (stub.dirty[i]) |vreg| {
+                    const qreg: u5 = @intCast(@as(u6, SIMD_QREG_BASE) + @as(u6, @intCast(i)));
+                    self.emitStoreV128Raw(qreg, vreg);
+                }
+            }
+
+            // B to actual target (patched later by patchBranches)
+            const b_idx = self.currentIdx();
+            self.emit(a64.b(0)); // placeholder
+            self.patches.append(self.alloc, .{
+                .arm64_idx = b_idx,
+                .target_pc = stub.target_pc,
+                .kind = .b,
+            }) catch {};
+
+            // Patch original conditional branch to point to this stub
+            const offset: i32 = @as(i32, @intCast(stub_idx)) - @as(i32, @intCast(stub.branch_idx));
+            switch (stub.kind) {
+                .cbz32 => {
+                    const imm: i19 = @intCast(offset);
+                    const orig = self.code.items[stub.branch_idx];
+                    const rd: u5 = @intCast(orig & 0x1F);
+                    self.code.items[stub.branch_idx] = a64.cbz32(rd, imm);
+                },
+                .cbnz32 => {
+                    const imm: i19 = @intCast(offset);
+                    const orig = self.code.items[stub.branch_idx];
+                    const rd: u5 = @intCast(orig & 0x1F);
+                    self.code.items[stub.branch_idx] = a64.cbnz32(rd, imm);
+                },
+                else => {},
             }
         }
     }

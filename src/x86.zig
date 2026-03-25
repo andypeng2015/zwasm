@@ -1731,6 +1731,10 @@ pub const Compiler = struct {
     /// IR slice and branch targets for peephole fusion (set during compile).
     ir_slice: []const RegInstr = &.{},
     branch_targets_slice: []bool = &.{},
+    /// Loop header markers: true for PCs that are targets of backward branches.
+    loop_headers_slice: []bool = &.{},
+    /// For each loop header PC, the max back-edge source PC (defines loop body range).
+    loop_end_map: []u32 = &.{},
 
     const Patch = struct {
         rel32_offset: u32, // byte offset of the rel32 field in code
@@ -3844,6 +3848,8 @@ pub const Compiler = struct {
         // Pre-scan: find branch targets for fusion safety
         const branch_targets = self.scanBranchTargets(ir) orelse return null;
         defer self.alloc.free(branch_targets);
+        defer self.alloc.free(self.loop_headers_slice);
+        defer self.alloc.free(self.loop_end_map);
         self.ir_slice = ir;
         self.branch_targets_slice = branch_targets;
 
@@ -3872,8 +3878,13 @@ pub const Compiler = struct {
         while (pc < ir.len) {
             // Evict SIMD XMM cache at branch targets (merge points)
             if (pc < branch_targets.len and branch_targets[pc]) {
-                self.simdXregEvictAll();
                 self.scratch_vreg = null;
+                if (pc < self.loop_headers_slice.len and self.loop_headers_slice[pc]) {
+                    // Loop header: emit pre-loads BEFORE pc_map (first iteration only)
+                    self.emitLoopPreHeader(ir, pc);
+                } else {
+                    self.simdXregEvictAll();
+                }
             }
             self.pc_map.items[pc] = self.currentOffset();
             const instr = ir[pc];
@@ -3955,6 +3966,74 @@ pub const Compiler = struct {
         for (0..SIMD_XREG_COUNT) |i| {
             self.simdXregEvictSlot(i);
         }
+    }
+
+    /// Flush all dirty XMM cache entries to simd_v128[] WITHOUT invalidating.
+    /// After flush, entries remain cached but marked clean (memory is up-to-date).
+    fn simdXregFlushAll(self: *Compiler) void {
+        for (0..SIMD_XREG_COUNT) |i| {
+            if (self.simd_xreg[i]) |vreg| {
+                if (self.simd_xreg_dirty[i]) {
+                    const xreg: u4 = @intCast(@as(u5, SIMD_XREG_BASE) + @as(u5, @intCast(i)));
+                    self.emitStoreV128Raw(xreg, vreg);
+                    self.simd_xreg_dirty[i] = false;
+                }
+            }
+        }
+    }
+
+    /// Emit loop pre-header: load v128 input vregs into XMM regs before the loop header.
+    fn emitLoopPreHeader(self: *Compiler, ir: []const RegInstr, header_pc: u32) void {
+        const end_pc = if (header_pc < self.loop_end_map.len) self.loop_end_map[header_pc] else return;
+        if (end_pc == 0) return;
+
+        var written = [_]bool{false} ** 128;
+        var n_inputs: usize = 0;
+        var inputs: [SIMD_XREG_COUNT]u16 = undefined;
+
+        var scan_pc = header_pc;
+        while (scan_pc <= end_pc and scan_pc < ir.len) : (scan_pc += 1) {
+            const instr = ir[scan_pc];
+            const op = instr.op;
+
+            if (op >= predecode_mod.SIMD_BASE and op <= predecode_mod.SIMD_BASE + 0x113) {
+                const sub = op - predecode_mod.SIMD_BASE;
+
+                if (instr.rs1 < 128 and (self.v128_vregs & (@as(u128, 1) << @as(u7, @intCast(instr.rs1)))) != 0) {
+                    if (!written[instr.rs1]) {
+                        self.addLoopInput(&inputs, &n_inputs, instr.rs1);
+                    }
+                }
+                if (instr.rs2_field < 128 and (self.v128_vregs & (@as(u128, 1) << @as(u7, @intCast(instr.rs2_field)))) != 0) {
+                    if (!written[instr.rs2_field]) {
+                        self.addLoopInput(&inputs, &n_inputs, instr.rs2_field);
+                    }
+                }
+                if (predecode_mod.simdResultIsV128(sub) and instr.rd < 128) {
+                    written[instr.rd] = true;
+                }
+            }
+        }
+
+        if (n_inputs == 0) return;
+
+        self.simdXregEvictAll();
+        for (0..n_inputs) |i| {
+            const vreg = inputs[i];
+            self.simd_xreg[i] = vreg;
+            self.simd_xreg_dirty[i] = false;
+            const xreg: u4 = @intCast(@as(u5, SIMD_XREG_BASE) + @as(u5, @intCast(i)));
+            self.emitLoadV128Raw(xreg, vreg);
+        }
+    }
+
+    fn addLoopInput(_: *Compiler, inputs: *[SIMD_XREG_COUNT]u16, n: *usize, vreg: u16) void {
+        if (n.* >= SIMD_XREG_COUNT) return;
+        for (inputs.*[0..n.*]) |existing| {
+            if (existing == vreg) return;
+        }
+        inputs.*[n.*] = vreg;
+        n.* += 1;
     }
 
     fn simdXregInvalidate(self: *Compiler, vreg: u16) void {
@@ -5928,18 +6007,27 @@ pub const Compiler = struct {
 
             // --- Control flow ---
             regalloc_mod.OP_BR => {
-                // Fuel check at back-edges (target <= current pc)
-                if (instr.operand <= pc.* - 1) self.emitFuelCheck();
+                const target = instr.operand;
+                const is_back_edge = target <= pc.* - 1;
+                if (is_back_edge and target < self.loop_headers_slice.len and self.loop_headers_slice[target]) {
+                    // Back-edge to loop header: flush XMM (keep cache) for deopt safety
+                    self.simdXregFlushAll();
+                } else if (is_back_edge) {
+                    self.simdXregEvictAll();
+                }
+                if (is_back_edge) self.emitFuelCheck();
                 const patch_off = Enc.jmpRel32(&self.code, self.alloc);
                 self.patches.append(self.alloc, .{
                     .rel32_offset = patch_off,
-                    .target_pc = instr.operand,
+                    .target_pc = target,
                     .kind = .jmp,
                 }) catch return false;
             },
             regalloc_mod.OP_BR_IF => {
-                // Fuel check at back-edges
-                if (instr.operand <= pc.* - 1) self.emitFuelCheck();
+                const is_back_edge = instr.operand <= pc.* - 1;
+                // Conditional branches: flush XMM (keep cache for fall-through path).
+                self.simdXregFlushAll();
+                if (is_back_edge) self.emitFuelCheck();
                 // Branch if rd != 0
                 const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
                 Enc.testRegReg(&self.code, self.alloc, cond_reg, cond_reg);
@@ -5951,8 +6039,9 @@ pub const Compiler = struct {
                 }) catch return false;
             },
             regalloc_mod.OP_BR_IF_NOT => {
-                // Fuel check at back-edges
-                if (instr.operand <= pc.* - 1) self.emitFuelCheck();
+                const is_back_edge = instr.operand <= pc.* - 1;
+                self.simdXregFlushAll();
+                if (is_back_edge) self.emitFuelCheck();
                 const cond_reg = self.getOrLoad(instr.rd, SCRATCH);
                 Enc.testRegReg(&self.code, self.alloc, cond_reg, cond_reg);
                 const patch_off = Enc.jccRel32(&self.code, self.alloc, .e);
@@ -6388,16 +6477,43 @@ pub const Compiler = struct {
     fn scanBranchTargets(self: *Compiler, ir: []const RegInstr) ?[]bool {
         const targets = self.alloc.alloc(bool, ir.len) catch return null;
         @memset(targets, false);
+        const loop_headers = self.alloc.alloc(bool, ir.len) catch {
+            self.alloc.free(targets);
+            return null;
+        };
+        @memset(loop_headers, false);
+        const loop_end = self.alloc.alloc(u32, ir.len) catch {
+            self.alloc.free(loop_headers);
+            self.alloc.free(targets);
+            return null;
+        };
+        @memset(loop_end, 0);
+
         var scan_pc: u32 = 0;
         while (scan_pc < ir.len) {
             const instr = ir[scan_pc];
+            const source_pc = scan_pc;
             scan_pc += 1;
             switch (instr.op) {
                 regalloc_mod.OP_BR => {
-                    if (instr.operand < ir.len) targets[instr.operand] = true;
+                    if (instr.operand < ir.len) {
+                        targets[instr.operand] = true;
+                        if (instr.operand <= source_pc) {
+                            loop_headers[instr.operand] = true;
+                            if (source_pc > loop_end[instr.operand])
+                                loop_end[instr.operand] = source_pc;
+                        }
+                    }
                 },
                 regalloc_mod.OP_BR_IF, regalloc_mod.OP_BR_IF_NOT => {
-                    if (instr.operand < ir.len) targets[instr.operand] = true;
+                    if (instr.operand < ir.len) {
+                        targets[instr.operand] = true;
+                        if (instr.operand <= source_pc) {
+                            loop_headers[instr.operand] = true;
+                            if (source_pc > loop_end[instr.operand])
+                                loop_end[instr.operand] = source_pc;
+                        }
+                    }
                 },
                 regalloc_mod.OP_BR_TABLE => {
                     const count = instr.operand;
@@ -6405,7 +6521,14 @@ pub const Compiler = struct {
                     while (i < count + 1 and scan_pc < ir.len) : (i += 1) {
                         const entry = ir[scan_pc];
                         scan_pc += 1;
-                        if (entry.operand < ir.len) targets[entry.operand] = true;
+                        if (entry.operand < ir.len) {
+                            targets[entry.operand] = true;
+                            if (entry.operand <= source_pc) {
+                                loop_headers[entry.operand] = true;
+                                if (source_pc > loop_end[entry.operand])
+                                    loop_end[entry.operand] = source_pc;
+                            }
+                        }
                     }
                 },
                 regalloc_mod.OP_BLOCK_END => {
@@ -6414,6 +6537,8 @@ pub const Compiler = struct {
                 else => {},
             }
         }
+        self.loop_headers_slice = loop_headers;
+        self.loop_end_map = loop_end;
         return targets;
     }
 

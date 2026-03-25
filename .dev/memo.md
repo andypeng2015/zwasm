@@ -16,64 +16,43 @@ Session handover document. Read at session start.
 
 ## Current Task
 
-**W45: SIMD Loop Persistence — NEXT**
+**W45: SIMD Loop Persistence — DONE (2026-03-26)**
 
-Keep Q/XMM-cached v128 values alive across loop iterations. Currently
-`evictAllCaches()` at every branch target (including loop headers) flushes
-all Q regs, destroying the W44 cache benefit in loops.
+Q-reg/XMM cache now persists across loop iterations. Three techniques:
 
-### Problem (diagnosed 2026-03-26)
+1. **Loop pre-header**: pre-loads v128 input vregs into Q/XMM before pc_map entry.
+   Back-edges skip pre-loads (jump to pc_map). First iteration pays LDR cost once.
 
-```
-loop_header:          ← evictAllCaches() fires here
-  STR Q16 → mem       ; flush (5-6 vregs per iter)
-  STR Q17 → mem
-  LDR Q16 ← mem       ; reload (cold)
-  FMUL V17, V16, V16  ; actual compute
-  ...
-  B loop_header        ; → flush again
-```
+2. **Flush-not-evict at back-edges**: `simdQregFlushAll()` writes dirty Q-regs
+   to memory but keeps cache entries. Ensures deopt safety while preserving cache.
 
-Wasmtime keeps v128 in regs across iterations — 0 memory traffic.
+3. **Out-of-line flush stubs**: forward conditional branches (loop exits) use
+   stubs at function end. Fall-through (hot loop path) has zero flush overhead.
 
-### Facts
+### Results (2026-03-26)
 
-- ARM64 native SIMD: 247/276 ops (89%) — trampoline NOT the bottleneck
-- Mandelbrot: 12 NEON + 12 loads + 12 stores/iter → should be 12 NEON only
-- zwasm SIMD is **slower** than scalar (eviction overhead > SIMD benefit)
-- Current SIMD gap: 38-248x vs wasmtime (scalar gap: 1-6x)
+| Benchmark            | Before | After   | Improvement |
+|----------------------|--------|---------|-------------|
+| simd_mandel (simd)   | 18.7s  | 17.23s  | 8%          |
+| simd_matmul (simd)   | 2.7s   | 2.53s   | 6%          |
+| simd_chain           | 390ms  | 397ms   | ~same       |
+| simd_nbody (simd)    | 520ms  | 352ms   | 32%         |
+| scalar benchmarks    |        |         | no regress  |
 
-### Baseline benchmarks (2026-03-26, zwasm JIT cached vs wasmtime AOT cached)
+### Remaining SIMD gap
 
-| Benchmark            | zwasm  | wasmtime | ratio  | notes          |
-|----------------------|--------|----------|--------|----------------|
-| simd_mandel (simd)   | 18.7s  | 240ms    | 78x    | loop-dominated |
-| simd_matmul (simd)   | 2.7s   | 20ms     | 136x   | loop-dominated |
-| simd_chain           | 390ms  | 10ms     | 39x    | loop-dominated |
-| simd_nbody (simd)    | 520ms  | 10ms     | 52x    | loop-dominated |
-| fib (cached)         | 50ms   | 80ms     | 0.6x   | zwasm wins     |
-| st_fib2 (cached)     | 900ms  | 680ms    | 1.3x   | healthy        |
-| st_matrix (cached)   | 330ms  | 90ms     | 3.7x   | scalar gap     |
+| Benchmark            | zwasm  | wasmtime | ratio  |
+|----------------------|--------|----------|--------|
+| simd_mandel          | 17.2s  | 240ms    | 72x    |
+| simd_matmul          | 2.5s   | 20ms     | 125x   |
+| simd_chain           | 397ms  | 10ms     | 40x    |
+| simd_nbody           | 352ms  | 10ms     | 35x    |
 
-### Fix path (ordered by impact)
+### Next optimization opportunities
 
-1. **Loop-header Q-reg persistence** → 2-3x improvement
-   - Distinguish loop backedge targets from merge points
-   - At loop headers: skip eviction (same Q state from backedge)
-   - At merge points (if/else join): still evict (different paths)
-   - Key: `scanBranchTargets` needs loop detection (back edges)
-   - Code: `jit.zig` compile loop (line ~2604), `x86.zig` (line ~3872)
-   - Reference: fp_dreg cache already skips eviction in some cases
-
-2. **v128.load/store bounds check elimination** → 1.5-2x
-   - Guard pages already exist (`use_guard_pages`)
-   - v128.load/store should use same guard page path as scalar loads
-
-3. **FMLA instruction fusion** → 1.2-1.5x
-   - Detect `f32x4.mul + f32x4.add` pattern → emit ARM64 FMLA
-   - Peephole in emitSimdNativeInner or IR fusion pass
-
-4. Realistic target: **10-20x of wasmtime** (from current 38-248x)
+1. **v128.load/store guard page path** → reduce bounds check overhead
+2. **FMLA instruction fusion** → ARM64 fused multiply-add
+3. **Non-native SIMD ops to native** → reduce trampoline calls in loops
 
 ### Key code locations
 
@@ -94,7 +73,7 @@ Sources: `bench/simd/src/` (C: mandelbrot, matmul, simd_chain, nbody, etc.)
 
 | Item       | Description                                       | Status           |
 |------------|---------------------------------------------------|------------------|
-| **W45**    | **SIMD loop persistence (Q-reg across loops)**    | **Next**         |
+| W45        | SIMD loop persistence (Q-reg across loops)        | DONE (2026-3-26) |
 | W44        | SIMD register class (D132 Phase B)                | DONE (2026-3-26) |
 | Phase 18   | Lazy Compilation + CLI Extensions                 | Future           |
 | Zig 0.16   | API breaking changes                              | When released    |
