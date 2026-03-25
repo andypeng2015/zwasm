@@ -94,7 +94,7 @@ jobs:
       - name: Run E2E tests
         env:
           WASMTIME_MISC_DIR: ${{ runner.temp }}/wasmtime/tests/misc_testsuite
-        run: python test/e2e/run_e2e.py --convert --summary
+        run: python test/e2e/run_e2e.py --convert --summary --verbose
 
       - name: Build ReleaseSafe
         run: zig build -Doptimize=ReleaseSafe
