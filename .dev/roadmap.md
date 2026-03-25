@@ -39,10 +39,12 @@ Details: `roadmap-archive.md`.
 
 | Task                           | Priority | Impact                                    |
 |--------------------------------|----------|-------------------------------------------|
-| W37: Contiguous v128 storage   | Medium   | SIMD load/store 2-4x improvement expected |
+| ~~W37: Contiguous v128~~       | Done     | LDR Q / STR Q single-instruction v128     |
+| ~~W38: Lazy AOT perf~~         | Done     | HOT_THRESHOLD 10→3, back_edge_bailed      |
 | Multi-value return JIT         | Medium   | wide-arithmetic, multi-return fn JIT      |
+| SIMD register class            | Medium   | Keep v128 in Q regs across ops (big win)  |
+| v128 addr cache in prologue    | Low      | Cache &simd_v128 base, save 1-2 insns     |
 | Lazy compilation (Phase 18.2)  | Low      | Defer JIT to first call, faster startup   |
-| W38: Compiler pattern opt      | Low      | replace_lane fusion for C -msimd128 code  |
 
 ### Ecosystem & Usability
 
