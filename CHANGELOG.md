@@ -5,26 +5,58 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-04-03
+
 ### Added
 - SIMD JIT: ARM64 NEON (253/256 native) and x86_64 SSE (244/256 native) (Phase 13)
-- 5 real-world SIMD benchmarks (C -msimd128): grayscale, box_blur, sum_reduce, byte_freq, nbody
-- SIMD benchmark comparison infrastructure (`bench/run_simd_bench.sh`, `bench/simd_comparison.yaml`)
+- SIMD JIT optimizations: v128 base address cache (W43), Q-reg/XMM register class (W44), loop persistence (W45), guard page bounds check elimination (W46), FMLA/FMLS instruction fusion (W47)
+- C API: FD-based WASI stdio and preopen configuration (`zwasm_wasi_config_set_stdin_fd` etc.) (D133)
+- C API: `zwasm_module_invoke` args marked `const` (PR #16)
 - JIT fuel check at back-edges: enables timeout support for JIT-compiled code (Phase 19.2)
+- Epoch-based JIT timeout (D131): cooperative timeout via shared fuel counter
+- Multi-value return support in RegIR (`OP_RETURN_MULTI`)
 - `--interp` CLI flag for interpreter-only execution (debugging/differential testing)
 - Wide-arithmetic validation support (i64.add128, i64.sub128, i64.mul_wide_s/u)
+- 5 real-world SIMD benchmarks (C -msimd128): grayscale, box_blur, sum_reduce, byte_freq, nbody
+- 3 additional SIMD benchmarks: mandelbrot, matmul (C, wasi-sdk), blake2b_simd (Rust), simd_chain
+- SIMD benchmark comparison infrastructure (`bench/run_simd_bench.sh`, `bench/simd_comparison.yaml`)
+- Rust FFI example using zwasm C API
+- FFI tests in CI and commit/merge gate checklists
 
 ### Fixed
+- memory64: u64 offset decoding and i64 address handling across decoder, validator, predecoder, and VM — fixes wasm-tools 1.246.1 compatibility
+- JIT correctness sweep (Phase 20): 8 real-world compat programs fixed (45→50/50)
+  - ARM64 fuel check clobbering vreg 20 (x0) at loop back-edges
+  - `written_vregs` pre-scan: stale reload in loops after call sites
+  - Void self-call result clobber (`n_results` vs `result_count`)
+  - Void-call `reloadVreg` clobbering live local variables
+  - ARM64 ABI register clobbering in `emitMemFill`/`emitMemCopy`/`emitMemGrow`
+  - Remainder register aliasing when rd == rs1 (MSUB on ARM64)
+  - Stale scratch cache in signed division overflow check
+  - x86 i32 div/rem signed edge case: 32-bit CMP for -1 check
+- JIT memory64 bounds check and custom-page-sizes (CI failure since 3/24)
+- JIT `memory_grow64` truncation and cross-module call instance
+- JIT `extract_lane` encoding and back-edge poisoning
+- ARM64 JIT `simd_v128` sync in MOV/CONST for SIMD correctness
+- Q-cache stale read in `extract_lane` upper-half fallback
 - ARM64 JIT `emitGlobalSet` ABI clobber: vreg r21 overwritten before reading value (W35)
 - x86_64 wide-arithmetic E2E: 19 tests fixed (validator + Debug i128 build mode)
 - `i32.store16` access size in interpreter
 - `--interp` flag incomplete for `doCallDirectIR` path
+- Windows C API: `intptr_t` for host fd, cross-platform `File.close` for stdio handles
+- Shared library segfault on Linux x86_64 (PR #11)
 
 ### Changed
 - SIMD operations now JIT-compiled (was: stack interpreter only, ~22x slower)
 - SIMD microbenchmarks: image_blend **4.7x**, matrix_mul **1.6x** (beats wasmtime)
+- HOT_THRESHOLD lowered from 10 to 3 for earlier JIT compilation
+- Contiguous v128 storage layout for SIMD JIT (W37)
+- Real-world compat: Mac 50/50, Ubuntu 50/50 (was 42/50)
+- E2E tests: 795/795 on Mac (was 773/792 on Ubuntu)
+- Spec tests: 62,263/62,263 (100%, 0 skip)
+- Binary size: 1.29 MB stripped. Memory: ~3.5 MB RSS.
+- wasm-tools bumped to 1.246.1
 - E2E runner built with ReleaseSafe (fixes x86_64 Debug i128 issues)
-- E2E tests: 792/792 on both Mac and Ubuntu (was 773/792 on Ubuntu)
-- Binary size: 1.23 MB stripped. Memory: ~3.5 MB RSS.
 
 ## [1.3.0] - 2026-03-02
 
