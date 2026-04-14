@@ -233,14 +233,23 @@ pub const WasmModule = struct {
     /// Owned wasm bytes (from WAT conversion). Freed on deinit.
     owned_wasm_bytes: ?[]const u8 = null,
 
+    /// Persistent fuel budget.
+    fuel: ?u64 = null,
+    /// Persistent timeout setting.
+    timeout_ms: ?u64 = null,
+    /// Persistent interpreter-only flag. When non-null, `invoke()` applies this
+    /// to `vm.force_interpreter` before each call; when null, `vm.force_interpreter`
+    /// is left untouched so callers may set it directly on `self.vm`.
+    force_interpreter: ?bool = null,
+
     /// Load a Wasm module from binary bytes, decode, and instantiate.
     pub fn load(allocator: Allocator, wasm_bytes: []const u8) !*WasmModule {
-        return loadCore(allocator, wasm_bytes, false, null, null);
+        return loadCore(allocator, wasm_bytes, false, null, null, null, null);
     }
 
     /// Load with a fuel limit (traps start function if it exceeds the limit).
     pub fn loadWithFuel(allocator: Allocator, wasm_bytes: []const u8, fuel: u64) !*WasmModule {
-        return loadCore(allocator, wasm_bytes, false, null, fuel);
+        return loadCore(allocator, wasm_bytes, false, null, fuel, null, null);
     }
 
     /// Load a module from WAT (WebAssembly Text Format) source.
@@ -248,7 +257,7 @@ pub const WasmModule = struct {
     pub fn loadFromWat(allocator: Allocator, wat_source: []const u8) !*WasmModule {
         const wasm_bytes = try rt.wat.watToWasm(allocator, wat_source);
         errdefer allocator.free(wasm_bytes);
-        const self = try loadCore(allocator, wasm_bytes, false, null, null);
+        const self = try loadCore(allocator, wasm_bytes, false, null, null, null, null);
         self.owned_wasm_bytes = wasm_bytes;
         return self;
     }
@@ -257,14 +266,14 @@ pub const WasmModule = struct {
     pub fn loadFromWatWithFuel(allocator: Allocator, wat_source: []const u8, fuel: u64) !*WasmModule {
         const wasm_bytes = try rt.wat.watToWasm(allocator, wat_source);
         errdefer allocator.free(wasm_bytes);
-        const self = try loadCore(allocator, wasm_bytes, false, null, fuel);
+        const self = try loadCore(allocator, wasm_bytes, false, null, fuel, null, null);
         self.owned_wasm_bytes = wasm_bytes;
         return self;
     }
 
     /// Load a WASI module — registers wasi_snapshot_preview1 imports.
     pub fn loadWasi(allocator: Allocator, wasm_bytes: []const u8) !*WasmModule {
-        return loadCore(allocator, wasm_bytes, true, null, null);
+        return loadCore(allocator, wasm_bytes, true, null, null, null, null);
     }
 
     /// Apply WasiOptions to a WasiContext (shared logic for all WASI loaders).
@@ -301,30 +310,22 @@ pub const WasmModule = struct {
 
     /// Load a WASI module with custom args, env, and preopened directories.
     pub fn loadWasiWithOptions(allocator: Allocator, wasm_bytes: []const u8, opts: WasiOptions) !*WasmModule {
-        const self = try loadCore(allocator, wasm_bytes, true, null, null);
+        const self = try loadCore(allocator, wasm_bytes, true, null, null, null, null);
         errdefer self.deinit();
-
-        if (self.wasi_ctx) |*wc| {
-            try applyWasiOptions(wc, opts);
-        }
-
+        if (self.wasi_ctx) |*wc| try applyWasiOptions(wc, opts);
         return self;
     }
 
     /// Load with imports from other modules or host functions.
     pub fn loadWithImports(allocator: Allocator, wasm_bytes: []const u8, imports: []const ImportEntry) !*WasmModule {
-        return loadCore(allocator, wasm_bytes, false, imports, null);
+        return loadCore(allocator, wasm_bytes, false, imports, null, null, null);
     }
 
     /// Load with combined WASI + import support. Used by CLI for --link + WASI fallback.
     pub fn loadWasiWithImports(allocator: Allocator, wasm_bytes: []const u8, imports: ?[]const ImportEntry, opts: WasiOptions) !*WasmModule {
-        const self = try loadCore(allocator, wasm_bytes, true, imports, null);
+        const self = try loadCore(allocator, wasm_bytes, true, imports, null, null, null);
         errdefer self.deinit();
-
-        if (self.wasi_ctx) |*wc| {
-            try applyWasiOptions(wc, opts);
-        }
-
+        if (self.wasi_ctx) |*wc| try applyWasiOptions(wc, opts);
         return self;
     }
 
@@ -365,6 +366,9 @@ pub const WasmModule = struct {
         self.owned_wasm_bytes = null;
         self.store = rt.store_mod.Store.init(allocator);
         self.wasi_ctx = null;
+        self.fuel = null;
+        self.timeout_ms = null;
+        self.force_interpreter = null;
 
         self.module = rt.module_mod.Module.init(allocator, wasm_bytes);
         self.module.decode() catch |err| {
@@ -404,7 +408,7 @@ pub const WasmModule = struct {
         return .{ .module = self, .apply_error = apply_error };
     }
 
-    fn loadCore(allocator: Allocator, wasm_bytes: []const u8, wasi: bool, imports: ?[]const ImportEntry, fuel: ?u64) !*WasmModule {
+    fn loadCore(allocator: Allocator, wasm_bytes: []const u8, wasi: bool, imports: ?[]const ImportEntry, fuel: ?u64, timeout_ms: ?u64, force_interpreter: ?bool) !*WasmModule {
         const self = try allocator.create(WasmModule);
         errdefer allocator.destroy(self);
 
@@ -440,13 +444,21 @@ pub const WasmModule = struct {
         self.wit_funcs = &[_]wit_parser.WitFunc{};
 
         self.vm = try allocator.create(rt.vm_mod.Vm);
-        self.vm.* = rt.vm_mod.Vm.init(allocator);
-        self.vm.fuel = fuel;
 
-        // Execute start function if present
+        self.vm.* = rt.vm_mod.Vm.init(allocator);
+
+        self.fuel = fuel;
+        self.timeout_ms = timeout_ms;
+        self.force_interpreter = force_interpreter;
+
+        // Execute start function if present.
+        // Only apply persistent settings to the VM when explicitly set — a null
+        // persistent field means "inherit whatever the caller set on self.vm.*".
         if (self.module.start) |start_idx| {
             self.vm.reset();
-            self.vm.fuel = fuel;
+            if (self.fuel) |f| self.vm.fuel = f;
+            if (self.force_interpreter) |fi| self.vm.force_interpreter = fi;
+            if (self.timeout_ms) |ms| self.vm.setDeadlineTimeoutMs(ms);
             try self.vm.invokeByIndex(&self.instance, start_idx, &.{}, &.{});
         }
 
@@ -474,17 +486,31 @@ pub const WasmModule = struct {
 
     /// Invoke an exported function by name.
     /// Args and results are passed as u64 arrays.
+    ///
+    /// Persistent module settings (`self.fuel` / `self.timeout_ms` /
+    /// `self.force_interpreter`) override `self.vm.*` only when set (non-null).
+    /// A null persistent field preserves whatever the caller set directly on
+    /// `self.vm`, since `self.vm.reset()` does not clear these fields.
     pub fn invoke(self: *WasmModule, name: []const u8, args: []const u64, results: []u64) !void {
         self.vm.reset();
+        if (self.fuel) |f| self.vm.fuel = f;
+        if (self.force_interpreter) |fi| self.vm.force_interpreter = fi;
+        if (self.timeout_ms) |ms| self.vm.setDeadlineTimeoutMs(ms);
         try self.vm.invoke(&self.instance, name, args, results);
     }
 
     /// Invoke using only the stack-based interpreter, bypassing RegIR and JIT.
     /// Used by differential testing to get a reference result.
+    /// Restores the prior `vm.force_interpreter` value on return so the caller's
+    /// mode selection — whether set via `module.force_interpreter` or directly
+    /// on `module.vm.force_interpreter` — survives a diagnostic interpreter call.
     pub fn invokeInterpreterOnly(self: *WasmModule, name: []const u8, args: []const u64, results: []u64) !void {
         self.vm.reset();
+        if (self.fuel) |f| self.vm.fuel = f;
+        if (self.timeout_ms) |ms| self.vm.setDeadlineTimeoutMs(ms);
+        const saved_fi = self.vm.force_interpreter;
         self.vm.force_interpreter = true;
-        defer self.vm.force_interpreter = false;
+        defer self.vm.force_interpreter = saved_fi;
         try self.vm.invoke(&self.instance, name, args, results);
     }
 
@@ -1384,4 +1410,92 @@ test "loadWasiWithOptions explicit all grants full access" {
     try testing.expect(caps.allow_write);
     try testing.expect(caps.allow_env);
     try testing.expect(caps.allow_path);
+}
+
+test "force_interpreter — persistence across invoke and invokeInterpreterOnly" {
+    if (!@import("build_options").enable_wat) return error.SkipZigTest;
+    var wasm_mod = try WasmModule.loadFromWat(testing.allocator,
+        \\(module
+        \\  (func (export "f") (result i32)
+        \\    i32.const 42
+        \\  )
+        \\)
+    );
+    defer wasm_mod.deinit();
+
+    var results = [_]u64{0};
+
+    // Pattern A — legacy direct-vm: caller sets vm.force_interpreter; persistent
+    // field left null; invoke() must not clobber the caller's choice.
+    wasm_mod.force_interpreter = null;
+    wasm_mod.vm.force_interpreter = true;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == true);
+    try testing.expectEqual(@as(u64, 42), results[0]);
+
+    // invokeInterpreterOnly under Pattern A must restore vm.force_interpreter
+    // to the caller's value (true), not to the persistent-field default.
+    try wasm_mod.invokeInterpreterOnly("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == true);
+
+    // Pattern B — new persistent-field override. vm.force_interpreter gets
+    // overridden from `module.force_interpreter` on every invoke.
+    wasm_mod.vm.force_interpreter = false;
+    wasm_mod.force_interpreter = true;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == true);
+
+    // invokeInterpreterOnly under Pattern B restores to true (the value live on
+    // vm at entry), so a subsequent regular invoke still sees interpreter mode.
+    try wasm_mod.invokeInterpreterOnly("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == true);
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == true);
+
+    // Pattern C — persistent field explicitly cleared to false wins over a
+    // prior vm.force_interpreter = true caller mutation.
+    wasm_mod.force_interpreter = false;
+    wasm_mod.vm.force_interpreter = true;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == false);
+
+    // Pattern D — null persistent + false vm stays false.
+    wasm_mod.force_interpreter = null;
+    wasm_mod.vm.force_interpreter = false;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.force_interpreter == false);
+}
+
+test "fuel and timeout — persistence and caller-set preservation" {
+    if (!@import("build_options").enable_wat) return error.SkipZigTest;
+    var wasm_mod = try WasmModule.loadFromWat(testing.allocator,
+        \\(module
+        \\  (func (export "f") (result i32)
+        \\    i32.const 42
+        \\  )
+        \\)
+    );
+    defer wasm_mod.deinit();
+    var results = [_]u64{0};
+
+    // Pattern A — caller sets vm.fuel directly; persistent null must not wipe it.
+    wasm_mod.fuel = null;
+    wasm_mod.vm.fuel = 1_000;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.fuel != null);
+
+    // Pattern B — persistent module.fuel overrides per-invoke.
+    wasm_mod.fuel = 500;
+    wasm_mod.vm.fuel = null;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.fuel != null);
+    try testing.expect(wasm_mod.vm.fuel.? <= 500);
+
+    // timeout — caller-set deadline must not be wiped by null persistent.
+    wasm_mod.timeout_ms = null;
+    wasm_mod.vm.setDeadlineTimeoutMs(5_000);
+    const deadline_before = wasm_mod.vm.deadline_ns;
+    try wasm_mod.invoke("f", &.{}, &results);
+    try testing.expect(wasm_mod.vm.deadline_ns != null);
+    try testing.expectEqual(deadline_before, wasm_mod.vm.deadline_ns);
 }
