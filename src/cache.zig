@@ -165,31 +165,23 @@ pub fn wasmHash(wasm_bin: []const u8) [32]u8 {
 
 /// Get cache directory path (~/.cache/zwasm/). Creates it if needed.
 /// Returns owned slice. Caller must free.
-pub fn getCacheDir(alloc: Allocator) ![]u8 {
+pub fn getCacheDir(io: std.Io, alloc: Allocator) ![]u8 {
     const path = try platform.appCacheDir(alloc, "zwasm");
-    // Ensure directory exists
-    var path_z: [std.posix.PATH_MAX]u8 = undefined;
-    if (path.len >= path_z.len) {
-        alloc.free(path);
-        return error.NoCacheDir;
-    }
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const rc = std.c.mkdir(@ptrCast(&path_z), 0o777);
-    if (rc != 0) {
-        const e: std.posix.E = @enumFromInt(std.c._errno().*);
-        if (e != .EXIST) {
+    // Ensure directory exists. Use std.Io.Dir so Windows works.
+    std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
             alloc.free(path);
             return error.NoCacheDir;
-        }
-    }
+        },
+    };
     return path;
 }
 
 /// Get cache file path for a given wasm hash.
 /// Returns owned slice. Caller must free.
-pub fn getCachePath(alloc: Allocator, hash: [32]u8) ![]u8 {
-    const dir = try getCacheDir(alloc);
+pub fn getCachePath(io: std.Io, alloc: Allocator, hash: [32]u8) ![]u8 {
+    const dir = try getCacheDir(io, alloc);
     defer alloc.free(dir);
     // Format hash as hex string
     var hex: [64]u8 = undefined;
@@ -201,55 +193,31 @@ pub fn getCachePath(alloc: Allocator, hash: [32]u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}/{s}.zwcache", .{ dir, hex });
 }
 
-/// Save serialized cache to disk.
-pub fn saveToFile(alloc: Allocator, hash: [32]u8, ir_funcs: []const ?*const IrFunc) !void {
+/// Save serialized cache to disk. Uses `std.Io.Dir` so Windows works without
+/// libc POSIX shims (on POSIX systems, the io-threaded path reduces to the
+/// same syscalls).
+pub fn saveToFile(io: std.Io, alloc: Allocator, hash: [32]u8, ir_funcs: []const ?*const IrFunc) !void {
     const data = try serialize(alloc, hash, ir_funcs);
     defer alloc.free(data);
-    const path = try getCachePath(alloc, hash);
+    const path = try getCachePath(io, alloc, hash);
     defer alloc.free(path);
-    var path_z: [std.posix.PATH_MAX]u8 = undefined;
-    if (path.len >= path_z.len) return error.NameTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const flags: std.posix.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = std.c.open(@ptrCast(&path_z), flags, @as(std.c.mode_t, 0o666));
-    if (fd < 0) return error.AccessDenied;
-    defer _ = std.c.close(fd);
-    var remaining: []const u8 = data;
-    while (remaining.len > 0) {
-        const rc = std.c.write(fd, remaining.ptr, remaining.len);
-        if (rc < 0) return error.WriteFailed;
-        remaining = remaining[@as(usize, @intCast(rc))..];
-    }
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    defer file.close(io);
+    try file.writePositionalAll(io, data, 0);
 }
 
 /// Load cached IR from disk. Returns null on miss or mismatch.
-pub fn loadFromFile(alloc: Allocator, hash: [32]u8) !?[]?*IrFunc {
-    const path = getCachePath(alloc, hash) catch return null;
+pub fn loadFromFile(io: std.Io, alloc: Allocator, hash: [32]u8) !?[]?*IrFunc {
+    const path = getCachePath(io, alloc, hash) catch return null;
     defer alloc.free(path);
-    var path_z: [std.posix.PATH_MAX]u8 = undefined;
-    if (path.len >= path_z.len) return null;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-    const flags: std.posix.O = .{ .ACCMODE = .RDONLY };
-    const fd = std.c.open(@ptrCast(&path_z), flags, @as(std.c.mode_t, 0));
-    if (fd < 0) return null;
-    defer _ = std.c.close(fd);
-    // `std.c.fstat` is unavailable on Linux in Zig 0.16 — use lseek for size
-    // (cache files are regular seekable files, so SEEK_END is reliable).
-    const end = std.c.lseek(fd, 0, std.posix.SEEK.END);
-    if (end < 0) return null;
-    _ = std.c.lseek(fd, 0, std.posix.SEEK.SET);
-    const size_u64: u64 = @intCast(end);
-    if (size_u64 > 256 * 1024 * 1024) return null; // sanity limit: 256 MB
-    const data = try alloc.alloc(u8, @intCast(size_u64));
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+    const len = file.length(io) catch return null;
+    if (len > 256 * 1024 * 1024) return null; // sanity limit: 256 MB
+    const data = try alloc.alloc(u8, @intCast(len));
     defer alloc.free(data);
-    var filled: usize = 0;
-    while (filled < data.len) {
-        const rc = std.c.read(fd, data.ptr + filled, data.len - filled);
-        if (rc <= 0) return null;
-        filled += @intCast(rc);
-    }
+    const n = file.readPositionalAll(io, data, 0) catch return null;
+    if (n != data.len) return null;
     return deserialize(alloc, data, hash);
 }
 

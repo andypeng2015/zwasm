@@ -468,7 +468,7 @@ fn cmdRun(allocator: Allocator, args: []const []const u8, stdout: *std.Io.Writer
         var cache_hit = false;
         if (cache_mode) {
             wasm_hash = cache_mod.wasmHash(wasm_bytes);
-            if (cache_mod.loadFromFile(allocator, wasm_hash) catch null) |cached| {
+            if (cache_mod.loadFromFile(cli_io, allocator,wasm_hash) catch null) |cached| {
                 cache_mod.applyCachedIr(cached, module.store.functions.items, module.module.num_imported_funcs);
                 allocator.free(cached); // IrFuncs transferred to WasmFunctions
                 cache_hit = true;
@@ -621,7 +621,7 @@ fn cmdRun(allocator: Allocator, args: []const []const u8, stdout: *std.Io.Writer
         var wasi_cache_hit = false;
         if (cache_mode) {
             wasi_wasm_hash = cache_mod.wasmHash(wasm_bytes);
-            if (cache_mod.loadFromFile(allocator, wasi_wasm_hash) catch null) |cached| {
+            if (cache_mod.loadFromFile(cli_io, allocator,wasi_wasm_hash) catch null) |cached| {
                 cache_mod.applyCachedIr(cached, module.store.functions.items, module.module.num_imported_funcs);
                 allocator.free(cached); // IrFuncs transferred to WasmFunctions
                 wasi_cache_hit = true;
@@ -677,7 +677,7 @@ fn cmdRun(allocator: Allocator, args: []const []const u8, stdout: *std.Io.Writer
 fn saveCacheQuietly(allocator: Allocator, hash: [32]u8, funcs: []store_mod.Function, num_imports: u32) void {
     const ir_funcs = cache_mod.collectIrFuncs(allocator, funcs, num_imports) catch return;
     defer allocator.free(ir_funcs);
-    cache_mod.saveToFile(allocator, hash, ir_funcs) catch {};
+    cache_mod.saveToFile(cli_io, allocator,hash, ir_funcs) catch {};
 }
 
 const store_mod = @import("store.zig");
@@ -719,7 +719,7 @@ fn cmdCompile(allocator: Allocator, args: []const []const u8, stdout: *std.Io.Wr
     };
     defer allocator.free(ir_funcs);
 
-    cache_mod.saveToFile(allocator, hash, ir_funcs) catch |err| {
+    cache_mod.saveToFile(cli_io, allocator,hash, ir_funcs) catch |err| {
         try stderr.print("error: failed to save cache: {s}\n", .{@errorName(err)});
         try stderr.flush();
         return false;
@@ -731,7 +731,7 @@ fn cmdCompile(allocator: Allocator, args: []const []const u8, stdout: *std.Io.Wr
         if (ir != null) predecoded += 1;
     }
 
-    const cache_path = cache_mod.getCachePath(allocator, hash) catch {
+    const cache_path = cache_mod.getCachePath(cli_io, allocator, hash) catch {
         try stderr.print("compiled {d}/{d} functions\n", .{ predecoded, ir_funcs.len });
         try stderr.flush();
         return true;

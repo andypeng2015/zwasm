@@ -18,8 +18,13 @@ const page_size = std.heap.page_size_min;
 
 const posix = std.posix;
 const windows = std.os.windows;
+// Zig 0.16 trimmed kernel32 down to CreateProcessW — declare the exception-
+// handler entry point ourselves. Signature from Win32 SDK.
+extern "kernel32" fn AddVectoredExceptionHandler(
+    First: windows.ULONG,
+    Handler: *const fn (*windows.EXCEPTION_POINTERS) callconv(.winapi) c_long,
+) callconv(.winapi) ?*anyopaque;
 
-const kernel32 = std.os.windows.kernel32;
 
 // Local `ucontext_t` definitions. Zig 0.16.0 moved the upstream type into
 // `std.debug.cpu_context` (private `signal_ucontext_t`), matching the kernel
@@ -268,7 +273,7 @@ var windows_handler_installed = false;
 
 fn installWindowsHandler() void {
     if (windows_handler_installed) return;
-    const handle = kernel32.AddVectoredExceptionHandler(1, windowsHandler);
+    const handle = AddVectoredExceptionHandler(1, windowsHandler);
     if (handle != null) {
         windows_handler_installed = true;
     }

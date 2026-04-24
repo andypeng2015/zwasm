@@ -13,7 +13,7 @@ const posix = std.posix;
 const mem = std.mem;
 const Allocator = mem.Allocator;
 const windows = std.os.windows;
-const kernel32 = std.os.windows.kernel32;
+const platform = @import("platform.zig");
 const vm_mod = @import("vm.zig");
 const Vm = vm_mod.Vm;
 const WasmError = vm_mod.WasmError;
@@ -175,7 +175,9 @@ const HostHandle = struct {
         const duplicated = if (builtin.os.tag == .windows) blk: {
             const proc = windows.GetCurrentProcess();
             var dup_handle: windows.HANDLE = undefined;
-            if (kernel32.DuplicateHandle(proc, self.raw, proc, &dup_handle, 0, 0, windows.DUPLICATE_SAME_ACCESS) == 0) {
+            // Our own DuplicateHandle extern in `platform` — 0.16 trimmed it
+            // out of `std.os.windows.kernel32`.
+            if (platform.DuplicateHandle(proc, self.raw, proc, &dup_handle, 0, windows.BOOL.FALSE, platform.DUPLICATE_SAME_ACCESS) == windows.BOOL.FALSE) {
                 switch (windows.GetLastError()) {
                     .NOT_ENOUGH_MEMORY => return error.SystemResources,
                     .ACCESS_DENIED => return error.AccessDenied,
@@ -1309,7 +1311,7 @@ pub fn path_filestat_get(ctx: *anyopaque, _: usize) anyerror!void {
     const path = data[path_ptr .. path_ptr + path_len];
     if (comptime builtin.os.tag == .windows) {
         // Windows: Dir.statFile always follows symlinks (no lstat equivalent)
-        const stat = dir.statFile(path) catch |err| {
+        const stat = dir.statFile(vm.io, path, .{}) catch |err| {
             try pushErrno(vm, toWasiErrno(err));
             return;
         };
@@ -1373,7 +1375,7 @@ pub fn path_open(ctx: *anyopaque, _: usize) anyerror!void {
             const opened_dir = dir.openDir(vm.io, path, .{
                 .access_sub_paths = true,
                 .iterate = true,
-                .no_follow = dirflags & 0x01 == 0,
+                .follow_symlinks = dirflags & 0x01 != 0,
             }) catch |err| {
                 try pushErrno(vm, toWasiErrno(err));
                 return;
@@ -1563,9 +1565,17 @@ pub fn fd_datasync(ctx: *anyopaque, _: usize) anyerror!void {
     };
 
     if (wasi.getHostFd(fd)) |host_fd| {
-        if (std.c.fdatasync(host_fd) != 0) {
-            try pushErrno(vm, cErrnoToWasi());
-            return;
+        if (builtin.os.tag == .windows) {
+            // FlushFileBuffers handles both data and metadata sync on Windows.
+            if (platform.FlushFileBuffers(host_fd) == windows.BOOL.FALSE) {
+                try pushErrno(vm, .IO);
+                return;
+            }
+        } else {
+            if (std.c.fdatasync(host_fd) != 0) {
+                try pushErrno(vm, cErrnoToWasi());
+                return;
+            }
         }
         try pushErrno(vm, .SUCCESS);
     } else {
@@ -1591,9 +1601,16 @@ pub fn fd_sync(ctx: *anyopaque, _: usize) anyerror!void {
     };
 
     if (wasi.getHostFd(fd)) |host_fd| {
-        if (std.c.fsync(host_fd) != 0) {
-            try pushErrno(vm, cErrnoToWasi());
-            return;
+        if (builtin.os.tag == .windows) {
+            if (platform.FlushFileBuffers(host_fd) == windows.BOOL.FALSE) {
+                try pushErrno(vm, .IO);
+                return;
+            }
+        } else {
+            if (std.c.fsync(host_fd) != 0) {
+                try pushErrno(vm, cErrnoToWasi());
+                return;
+            }
         }
         try pushErrno(vm, .SUCCESS);
     } else {
@@ -1625,6 +1642,15 @@ pub fn path_create_directory(ctx: *anyopaque, _: usize) anyerror!void {
     if (path_ptr + path_len > data.len) return error.OutOfBoundsMemoryAccess;
     const path = data[path_ptr .. path_ptr + path_len];
 
+    if (builtin.os.tag == .windows) {
+        var dir = std.Io.Dir{ .handle = host_fd };
+        dir.createDir(vm.io, path, .default_dir) catch |err| {
+            try pushErrno(vm, toWasiErrno(err));
+            return;
+        };
+        try pushErrno(vm, .SUCCESS);
+        return;
+    }
     var path_buf: [std.posix.PATH_MAX]u8 = undefined;
     const path_z = pathToZ(&path_buf, path) catch {
         try pushErrno(vm, .NAMETOOLONG);
@@ -1661,6 +1687,15 @@ pub fn path_remove_directory(ctx: *anyopaque, _: usize) anyerror!void {
     if (path_ptr + path_len > data.len) return error.OutOfBoundsMemoryAccess;
     const path = data[path_ptr .. path_ptr + path_len];
 
+    if (builtin.os.tag == .windows) {
+        var dir = std.Io.Dir{ .handle = host_fd };
+        dir.deleteDir(vm.io, path) catch |err| {
+            try pushErrno(vm, toWasiErrno(err));
+            return;
+        };
+        try pushErrno(vm, .SUCCESS);
+        return;
+    }
     var path_buf: [std.posix.PATH_MAX]u8 = undefined;
     const path_z = pathToZ(&path_buf, path) catch {
         try pushErrno(vm, .NAMETOOLONG);
@@ -1697,6 +1732,15 @@ pub fn path_unlink_file(ctx: *anyopaque, _: usize) anyerror!void {
     if (path_ptr + path_len > data.len) return error.OutOfBoundsMemoryAccess;
     const path = data[path_ptr .. path_ptr + path_len];
 
+    if (builtin.os.tag == .windows) {
+        var dir = std.Io.Dir{ .handle = host_fd };
+        dir.deleteFile(vm.io, path) catch |err| {
+            try pushErrno(vm, toWasiErrno(err));
+            return;
+        };
+        try pushErrno(vm, .SUCCESS);
+        return;
+    }
     var path_buf: [std.posix.PATH_MAX]u8 = undefined;
     const path_z = pathToZ(&path_buf, path) catch {
         try pushErrno(vm, .NAMETOOLONG);
@@ -1742,6 +1786,16 @@ pub fn path_rename(ctx: *anyopaque, _: usize) anyerror!void {
     const old_path = data[old_path_ptr .. old_path_ptr + old_path_len];
     const new_path = data[new_path_ptr .. new_path_ptr + new_path_len];
 
+    if (builtin.os.tag == .windows) {
+        var old_dir = std.Io.Dir{ .handle = old_host_fd };
+        const new_dir = std.Io.Dir{ .handle = new_host_fd };
+        old_dir.rename(old_path, new_dir, new_path, vm.io) catch |err| {
+            try pushErrno(vm, toWasiErrno(err));
+            return;
+        };
+        try pushErrno(vm, .SUCCESS);
+        return;
+    }
     var old_buf: [std.posix.PATH_MAX]u8 = undefined;
     var new_buf: [std.posix.PATH_MAX]u8 = undefined;
     const old_z = pathToZ(&old_buf, old_path) catch {
@@ -1935,7 +1989,7 @@ pub fn fd_filestat_set_size(ctx: *anyopaque, _: usize) anyerror!void {
             try pushErrno(vm, .BADF);
             return;
         };
-        file.setEndPos(@bitCast(size)) catch |err| {
+        file.setLength(vm.io, @bitCast(size)) catch |err| {
             try pushErrno(vm, toWasiErrno(err));
             return;
         };
@@ -2042,7 +2096,7 @@ pub fn fd_pread(ctx: *anyopaque, _: usize) anyerror!void {
             if (iov_ptr + iov_len > data.len) return error.OutOfBoundsMemoryAccess;
 
             const buf = data[iov_ptr .. iov_ptr + iov_len];
-            const n = file.pread(buf, cur_offset) catch |err| {
+            const n = file.readPositionalAll(vm.io, buf, cur_offset) catch |err| {
                 try pushErrno(vm, toWasiErrno(err));
                 return;
             };
@@ -2124,13 +2178,13 @@ pub fn fd_pwrite(ctx: *anyopaque, _: usize) anyerror!void {
             if (iov_ptr + iov_len > data.len) return error.OutOfBoundsMemoryAccess;
 
             const buf = data[iov_ptr .. iov_ptr + iov_len];
-            const n = file.pwrite(buf, cur_offset) catch |err| {
+            file.writePositionalAll(vm.io, buf, cur_offset) catch |err| {
                 try pushErrno(vm, toWasiErrno(err));
                 return;
             };
+            const n = buf.len;
             total += @intCast(n);
             cur_offset += n;
-            if (n < buf.len) break;
         }
 
         try memory.write(u32, nwritten_ptr, 0, total);
@@ -2421,6 +2475,16 @@ pub fn path_readlink(ctx: *anyopaque, _: usize) anyerror!void {
     const path = data[path_ptr .. path_ptr + path_len];
     const buf = data[buf_ptr .. buf_ptr + buf_len];
 
+    if (builtin.os.tag == .windows) {
+        var dir = std.Io.Dir{ .handle = host_fd };
+        const n = dir.readLink(vm.io, path, buf) catch |err| {
+            try pushErrno(vm, toWasiErrno(err));
+            return;
+        };
+        try memory.write(u32, bufused_ptr, 0, @intCast(n));
+        try pushErrno(vm, .SUCCESS);
+        return;
+    }
     var path_buf_z: [std.posix.PATH_MAX]u8 = undefined;
     const path_z = pathToZ(&path_buf_z, path) catch {
         try pushErrno(vm, .NAMETOOLONG);
