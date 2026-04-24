@@ -115,17 +115,33 @@ const FILE_END: windows.DWORD = 2;
 const ERROR_HANDLE_EOF: windows.DWORD = 38;
 const ERROR_BROKEN_PIPE: windows.DWORD = 109;
 
-// Linux direct-syscall helpers. Handles the `usize` return convention
-// (errno encoded as negative values cast to usize) and keeps `std.c._errno`
-// in sync so existing `cErrnoToWasi`-style callers keep working during the
-// un-link-libc migration (W46).
+// Thread-local errno set by pfd helpers. Read via `pfdErrno()`. Callers that
+// previously consulted `std.c._errno().*` should use `pfdErrno()` instead so
+// the code path does not depend on libc being linked.
+pub threadlocal var pfd_last_errno: std.posix.E = .SUCCESS;
+
+pub fn pfdErrno() std.posix.E {
+    return pfd_last_errno;
+}
+
+/// Copy libc's thread-local errno slot into `pfd_last_errno`. Call this after
+/// a `std.c.*` call has returned a failure so that `pfdErrno()` reflects the
+/// actual failure. Mac/BSD code paths use this; Linux pfd helpers set
+/// `pfd_last_errno` directly from the syscall return value.
+pub fn syncErrnoFromLibC() void {
+    switch (comptime builtin.os.tag) {
+        .linux, .windows => {},
+        else => pfd_last_errno = @enumFromInt(std.c._errno().*),
+    }
+}
+
+// Linux direct-syscall helpers. Syscalls return errno as negative values
+// cast to `usize`; convert that into the POSIX-style (-1, errno-in-slot)
+// convention that upstream callers already expect.
 fn linuxResultAsIsize(rc: usize) isize {
     const e = std.os.linux.errno(rc);
     if (e != .SUCCESS) {
-        // Mirror errno into libc's thread-local slot so that callers that
-        // read `std.c._errno()` see the failure. Direct Linux syscalls
-        // don't touch this slot on their own.
-        std.c._errno().* = @intFromEnum(e);
+        pfd_last_errno = e;
         return -1;
     }
     return @bitCast(rc);
@@ -134,7 +150,7 @@ fn linuxResultAsIsize(rc: usize) isize {
 fn linuxResultAsI32(rc: usize) i32 {
     const e = std.os.linux.errno(rc);
     if (e != .SUCCESS) {
-        std.c._errno().* = @intFromEnum(e);
+        pfd_last_errno = e;
         return -1;
     }
     return 0;
@@ -143,10 +159,29 @@ fn linuxResultAsI32(rc: usize) i32 {
 fn linuxResultAsI64(rc: usize) i64 {
     const e = std.os.linux.errno(rc);
     if (e != .SUCCESS) {
-        std.c._errno().* = @intFromEnum(e);
+        pfd_last_errno = e;
         return -1;
     }
     return @as(i64, @bitCast(@as(u64, rc)));
+}
+
+// Mac/BSD helpers — call after a `std.c.*` invocation so `pfd_last_errno`
+// reflects the failure. The `if` is comptime-inert on Linux/Windows because
+// the whole `else =>` arm is comptime-pruned.
+fn cResultAsIsize(rc: isize) isize {
+    if (rc < 0) pfd_last_errno = @enumFromInt(std.c._errno().*);
+    return rc;
+}
+
+fn cResultAsI32(rc: c_int) i32 {
+    const r: i32 = @intCast(rc);
+    if (r != 0) pfd_last_errno = @enumFromInt(std.c._errno().*);
+    return r;
+}
+
+fn cResultAsI64(rc: std.c.off_t) i64 {
+    if (rc < 0) pfd_last_errno = @enumFromInt(std.c._errno().*);
+    return @intCast(rc);
 }
 
 /// POSIX-style write. Returns bytes written (>= 0) or -1 on error.
@@ -155,11 +190,14 @@ pub fn pfdWrite(handle: std.posix.fd_t, buf: []const u8) isize {
         .windows => {
             var written: windows.DWORD = 0;
             const ok = WriteFile(handle, buf.ptr, @intCast(buf.len), &written, null);
-            if (ok == windows.BOOL.FALSE) return -1;
+            if (ok == windows.BOOL.FALSE) {
+                pfd_last_errno = .IO;
+                return -1;
+            }
             return @intCast(written);
         },
         .linux => return linuxResultAsIsize(std.os.linux.write(handle, buf.ptr, buf.len)),
-        else => return std.c.write(handle, buf.ptr, buf.len),
+        else => return cResultAsIsize(std.c.write(handle, buf.ptr, buf.len)),
     }
 }
 
@@ -172,12 +210,13 @@ pub fn pfdRead(handle: std.posix.fd_t, buf: []u8) isize {
             if (ok == windows.BOOL.FALSE) {
                 const err = GetLastError();
                 if (err == ERROR_BROKEN_PIPE or err == ERROR_HANDLE_EOF) return 0;
+                pfd_last_errno = .IO;
                 return -1;
             }
             return @intCast(got);
         },
         .linux => return linuxResultAsIsize(std.os.linux.read(handle, buf.ptr, buf.len)),
-        else => return std.c.read(handle, buf.ptr, buf.len),
+        else => return cResultAsIsize(std.c.read(handle, buf.ptr, buf.len)),
     }
 }
 
@@ -194,12 +233,13 @@ pub fn pfdPread(handle: std.posix.fd_t, buf: []u8, offset: u64) isize {
             if (ok == windows.BOOL.FALSE) {
                 const err = GetLastError();
                 if (err == ERROR_BROKEN_PIPE or err == ERROR_HANDLE_EOF) return 0;
+                pfd_last_errno = .IO;
                 return -1;
             }
             return @intCast(got);
         },
         .linux => return linuxResultAsIsize(std.os.linux.pread(handle, buf.ptr, buf.len, @intCast(offset))),
-        else => return std.c.pread(handle, buf.ptr, buf.len, @intCast(offset)),
+        else => return cResultAsIsize(std.c.pread(handle, buf.ptr, buf.len, @intCast(offset))),
     }
 }
 
@@ -213,11 +253,14 @@ pub fn pfdPwrite(handle: std.posix.fd_t, buf: []const u8, offset: u64) isize {
             };
             var written: windows.DWORD = 0;
             const ok = WriteFile(handle, buf.ptr, @intCast(buf.len), &written, &ov);
-            if (ok == windows.BOOL.FALSE) return -1;
+            if (ok == windows.BOOL.FALSE) {
+                pfd_last_errno = .IO;
+                return -1;
+            }
             return @intCast(written);
         },
         .linux => return linuxResultAsIsize(std.os.linux.pwrite(handle, buf.ptr, buf.len, @intCast(offset))),
-        else => return std.c.pwrite(handle, buf.ptr, buf.len, @intCast(offset)),
+        else => return cResultAsIsize(std.c.pwrite(handle, buf.ptr, buf.len, @intCast(offset))),
     }
 }
 
@@ -230,15 +273,21 @@ pub fn pfdSeek(handle: std.posix.fd_t, offset: i64, whence: c_int) i64 {
                 std.posix.SEEK.SET => FILE_BEGIN,
                 std.posix.SEEK.CUR => FILE_CURRENT,
                 std.posix.SEEK.END => FILE_END,
-                else => return -1,
+                else => {
+                    pfd_last_errno = .INVAL;
+                    return -1;
+                },
             };
             var new_pos: windows.LARGE_INTEGER = 0;
             const ok = SetFilePointerEx(handle, offset, &new_pos, method);
-            if (ok == windows.BOOL.FALSE) return -1;
+            if (ok == windows.BOOL.FALSE) {
+                pfd_last_errno = .IO;
+                return -1;
+            }
             return new_pos;
         },
         .linux => return linuxResultAsI64(std.os.linux.lseek(handle, offset, @intCast(whence))),
-        else => return std.c.lseek(handle, offset, whence),
+        else => return cResultAsI64(std.c.lseek(handle, offset, whence)),
     }
 }
 
@@ -258,7 +307,7 @@ pub fn pfdMkdirAt(dirfd: std.posix.fd_t, path: [*:0]const u8, mode: u32) i32 {
     switch (comptime builtin.os.tag) {
         .windows => return -1,
         .linux => return linuxResultAsI32(std.os.linux.mkdirat(dirfd, path, mode)),
-        else => return @intCast(std.c.mkdirat(dirfd, path, @intCast(mode))),
+        else => return cResultAsI32(std.c.mkdirat(dirfd, path, @intCast(mode))),
     }
 }
 
@@ -266,7 +315,7 @@ pub fn pfdUnlinkAt(dirfd: std.posix.fd_t, path: [*:0]const u8, flags: u32) i32 {
     switch (comptime builtin.os.tag) {
         .windows => return -1,
         .linux => return linuxResultAsI32(std.os.linux.unlinkat(dirfd, path, flags)),
-        else => return @intCast(std.c.unlinkat(dirfd, path, @intCast(flags))),
+        else => return cResultAsI32(std.c.unlinkat(dirfd, path, @intCast(flags))),
     }
 }
 
@@ -279,7 +328,7 @@ pub fn pfdRenameAt(
     switch (comptime builtin.os.tag) {
         .windows => return -1,
         .linux => return linuxResultAsI32(std.os.linux.renameat(old_dirfd, old_path, new_dirfd, new_path)),
-        else => return @intCast(std.c.renameat(old_dirfd, old_path, new_dirfd, new_path)),
+        else => return cResultAsI32(std.c.renameat(old_dirfd, old_path, new_dirfd, new_path)),
     }
 }
 
@@ -287,7 +336,7 @@ pub fn pfdReadlinkAt(dirfd: std.posix.fd_t, path: [*:0]const u8, buf: []u8) isiz
     switch (comptime builtin.os.tag) {
         .windows => return -1,
         .linux => return linuxResultAsIsize(std.os.linux.readlinkat(dirfd, path, buf.ptr, buf.len)),
-        else => return std.c.readlinkat(dirfd, path, buf.ptr, buf.len),
+        else => return cResultAsIsize(std.c.readlinkat(dirfd, path, buf.ptr, buf.len)),
     }
 }
 
@@ -298,28 +347,26 @@ pub fn pfdDup(fd: std.posix.fd_t) i32 {
             const rc = std.os.linux.dup(fd);
             const e = std.os.linux.errno(rc);
             if (e != .SUCCESS) {
-                std.c._errno().* = @intFromEnum(e);
+                pfd_last_errno = e;
                 return -1;
             }
             return @intCast(rc);
         },
-        else => return @intCast(std.c.dup(fd)),
+        else => return cResultAsI32(std.c.dup(fd)),
     }
 }
 
 pub fn pfdFsync(handle: std.posix.fd_t) i32 {
     switch (comptime builtin.os.tag) {
-        .windows => return if (FlushFileBuffers(handle) == windows.BOOL.FALSE) -1 else 0,
-        .linux => {
-            const rc = std.os.linux.fsync(handle);
-            const e = std.os.linux.errno(rc);
-            if (e != .SUCCESS) {
-                std.c._errno().* = @intFromEnum(e);
+        .windows => {
+            if (FlushFileBuffers(handle) == windows.BOOL.FALSE) {
+                pfd_last_errno = .IO;
                 return -1;
             }
             return 0;
         },
-        else => return std.c.fsync(handle),
+        .linux => return linuxResultAsI32(std.os.linux.fsync(handle)),
+        else => return cResultAsI32(std.c.fsync(handle)),
     }
 }
 
