@@ -43,11 +43,11 @@ pub fn main(init: std.process.Init) !void {
     for (args_z, args) |src, *dst| dst.* = src;
 
     var buf: [8192]u8 = undefined;
-    var writer = std.Io.File.stdout().writer(&buf);
+    var writer = std.Io.File.stdout().writer(init.io, &buf);
     const stdout = &writer.interface;
 
     var err_buf: [4096]u8 = undefined;
-    var err_writer = std.Io.File.stderr().writer(&err_buf);
+    var err_writer = std.Io.File.stderr().writer(init.io, &err_buf);
     const stderr = &err_writer.interface;
 
     if (args.len < 2) {
