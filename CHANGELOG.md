@@ -5,6 +5,50 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-04-26
+
+W46 + W48: re-disable `link_libc` on the core build and trim the release
+binary back under the original 1.60 MB ceiling. No public API changes;
+embedders upgrading from 1.10.0 should see a smaller binary and identical
+behaviour.
+
+### Changed
+- **Binary size ceiling**: pulled back from the Zig 0.16 transition value
+  1.80 MB to 1.60 MB. Stripped Mac aarch64 binary is ~1.18 MB; Linux ELF
+  is ~1.56 MB stripped. The original 1.50 MB target remains tracked as
+  W48 Phase 2 (non-blocking).
+
+### Fixed
+- `WasmModule.loadCore` now frees `export_fns` and `cached_fns` (and the
+  inner `param_types` / `result_types` slices) on the failure path when
+  the Wasm `start` function traps. The earlier `errdefer` chain unwound
+  vm/instance/wasi_ctx/module/store/self but skipped the export caches,
+  leaking the slices for any module with a non-empty export and a
+  trapping start function. The fix mirrors `deinit` so the failure path
+  is symmetric with normal teardown. (Issue #42)
+- OOM test in `loadLinked` now heap-allocates the `FailingAllocator` so
+  its address remains stable while the partially-loaded module is held;
+  the prior stack-allocated form was use-after-free under the test's
+  search loop. (PR #56 by @jtakakura)
+
+### Internal
+- **W46 Phase 1+2** (`link_libc=false` restoration): `build.zig` core
+  modules flipped to `.link_libc = false` while C API targets
+  (shared-lib, static-lib, c-test) keep `link_libc=true`. WASI
+  path-based ops, `cErrnoToWasi`, `trace.zig` stderr writes, and
+  `platform.appCacheDir` all routed through `platform.pfd*` helpers so
+  the core no longer pulls in libc on either OS. Linux direct syscalls
+  used where stdlib bindings are missing in 0.16 (`std.os.linux.statx`,
+  etc.).
+- **W48 Phase 1**: release binary trimmed via panic handler tightening,
+  segfault handler disabled in ReleaseSafe, and `main` return type
+  narrowed to `u8`. Combined effect restores the ceiling back below the
+  original 1.60 MB target.
+- Test-site `std.c.{pipe,dup,dup2,read,nanosleep}` calls gated for Linux
+  where the bindings are empty (W46 Phase 1c).
+- Credit @notxorand for the initial Zig 0.16.0 migration draft (PR #41,
+  superseded by the v1.10.0 work).
+
 ## [1.10.0] - 2026-04-24
 
 Toolchain bump from Zig 0.15.2 → **Zig 0.16.0** ("I/O as an Interface"). No
