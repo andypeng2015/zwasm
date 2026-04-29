@@ -5873,3 +5873,56 @@ entries:
       rw_cpp_string_cached: {time_ms: 5.4}
       rw_cpp_sort: {time_ms: 3.3}
       rw_cpp_sort_cached: {time_ms: 3.3}
+  - id: "1b4eb82"
+    date: "2026-04-29"
+    reason: "Record benchmark for ci(c-g step 3 followup): add bench-baseline workflow_dispatch (#89)"
+    commit: "1b4eb82"
+    arch: x86_64-linux
+    build: ReleaseSafe
+    results:
+      fib: {time_ms: 211.8}
+      fib_cached: {time_ms: 214.3}
+      tak: {time_ms: 26.1}
+      tak_cached: {time_ms: 26.1}
+      sieve: {time_ms: 8.6}
+      sieve_cached: {time_ms: 8.7}
+      nbody: {time_ms: 75.1}
+      nbody_cached: {time_ms: 75.3}
+      nqueens: {time_ms: 3.4}
+      nqueens_cached: {time_ms: 3.4}
+      tgo_fib: {time_ms: 120.8}
+      tgo_fib_cached: {time_ms: 121.1}
+      tgo_tak: {time_ms: 21.8}
+      tgo_tak_cached: {time_ms: 21.9}
+      tgo_arith: {time_ms: 2.7}
+      tgo_arith_cached: {time_ms: 2.8}
+      tgo_sieve: {time_ms: 7.6}
+      tgo_sieve_cached: {time_ms: 7.7}
+      tgo_fib_loop: {time_ms: 2.7}
+      tgo_fib_loop_cached: {time_ms: 2.8}
+      tgo_gcd: {time_ms: 2.8}
+      tgo_gcd_cached: {time_ms: 2.9}
+      tgo_nqueens: {time_ms: 168.3}
+      tgo_nqueens_cached: {time_ms: 168.5}
+      tgo_mfr: {time_ms: 356.5}
+      tgo_mfr_cached: {time_ms: 356.5}
+      tgo_list: {time_ms: 286.2}
+      tgo_list_cached: {time_ms: 286.5}
+      tgo_rwork: {time_ms: 25.0}
+      tgo_rwork_cached: {time_ms: 25.0}
+      tgo_strops: {time_ms: 149.1}
+      tgo_strops_cached: {time_ms: 149.3}
+      st_fib2: {time_ms: 3086.5}
+      st_fib2_cached: {time_ms: 3081.7}
+      st_sieve: {time_ms: 460.2}
+      st_sieve_cached: {time_ms: 459.9}
+      st_nestedloop: {time_ms: 3.7}
+      st_nestedloop_cached: {time_ms: 3.4}
+      st_ackermann: {time_ms: 6.7}
+      st_ackermann_cached: {time_ms: 6.4}
+      st_matrix: {time_ms: 589.5}
+      st_matrix_cached: {time_ms: 588.5}
+      gc_alloc: {time_ms: 16.3}
+      gc_alloc_cached: {time_ms: 16.6}
+      gc_tree: {time_ms: 178.4}
+      gc_tree_cached: {time_ms: 193.7}
