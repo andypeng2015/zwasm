@@ -10,13 +10,17 @@ Prefix: W## (to distinguish from CW's F## items).
 
 ## Open Items
 
-- [ ] W49: Plan C — remove remaining seven `if: runner.os != 'Windows'`
-  CI guards. None reflects a fundamental Windows incompatibility; each
-  is a shell-script or C-side limitation. Detailed table (C-a through
-  C-g, with risk classification and suggested order) in
-  `@./.dev/resume-guide.md`. No-Workaround Rule applies: a real
-  Windows-only zwasm bug surfaced during this work is fixed in zwasm,
-  not hidden behind another guard.
+- [ ] W49: Plan C — remove remaining `if: runner.os != 'Windows'` CI
+  guards. C-a / C-b / C-c / C-d / C-e / C-f all landed
+  post-2026-04-29 (PRs #68, #72, #71, #69, #70). Only **C-g**
+  (benchmark Ubuntu-only) remains, and per `CLAUDE.md`'s bench
+  policy that one is intentionally Ubuntu-only — Mac M4 Pro
+  history.yaml is the authoritative absolute baseline, CI bench is
+  the Ubuntu-vs-Ubuntu regression guard. Closing C-g would mean
+  either accepting noisy 3-platform comparisons or keeping the
+  Ubuntu-only behaviour and just removing the guard; no-op either
+  way. Treat W49 as effectively done unless the user wants C-g
+  formally closed; detailed status in `@./.dev/resume-guide.md`.
 
 - [ ] W50: Plan B sub-3 — CI Nix-ify. Replace per-tool installs in
   `ci.yml` test matrix with `DeterminateSystems/nix-installer-action`
@@ -29,12 +33,12 @@ Prefix: W## (to distinguish from CW's F## items).
   because magic-nix-cache had a 2025 outage and macos-latest +
   nix-installer-action has occasional flakes — wants supervised PR.
 
-- [ ] W52: realworld coverage on Windows — extend
-  `scripts/windows/install-tools.ps1` (or split off a follow-on
-  `install-extras.ps1`) with rustup-init + Go + TinyGo so
-  `build_all.py` no longer SKIPs those toolchains. Each is ~30 lines
-  of PowerShell pinned via `versions.lock`. Closes the gap from 25/50
-  to full 50/50 on Windows.
+- [x] W52: realworld coverage on Windows —
+  `scripts/windows/install-tools.ps1` extended with rustup-init +
+  Go + TinyGo (each pinned via `versions.lock`). Local self-hosted
+  Windows reaches 50/50 once the script runs. CI Windows runner
+  still 25/25 because it uses per-job `Setup Rust` and does not
+  install Go / TinyGo; CI adoption tracked separately under W50.
 
 - [ ] W45: SIMD loop persistence — Skip Q-cache eviction at loop headers.
   Requires back-edge detection in scanBranchTargets.
