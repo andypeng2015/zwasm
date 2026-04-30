@@ -19,6 +19,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# On Git Bash / MSYS, hyperfine spawns benchmarks via cmd /C, which does not
+# apply MSYS POSIX-to-Windows path translation. Convert paths to mixed form
+# (C:/foo/bar) so wasm path arguments resolve inside the spawned process.
+if command -v cygpath >/dev/null 2>&1; then
+    PROJECT_DIR="$(cygpath -m "$PROJECT_DIR")"
+fi
 ZWASM="$PROJECT_DIR/zig-out/bin/zwasm"
 
 BASE_REF="origin/main"
@@ -58,6 +64,11 @@ BENCHMARKS=(
 
 TMPDIR_CI=$(mktemp -d)
 trap "rm -rf $TMPDIR_CI" EXIT
+# Same Windows-form conversion as PROJECT_DIR — hyperfine's --export-json
+# target and the python3 reader must see the same path.
+if command -v cygpath >/dev/null 2>&1; then
+    TMPDIR_CI="$(cygpath -m "$TMPDIR_CI")"
+fi
 
 # Pre-compile all wasm files for cache
 precompile_for_cache() {
