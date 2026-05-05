@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **v2 from-scratch rewrite in progress.** A cleaner internal architecture, sharper layer boundaries, and a smaller surface area — folding back lessons from v1 that are hard to retrofit in place. Spec coverage and benchmark numbers will be preserved. **Breaking changes expected: directory / module structure, the C API (`zwasm.h` and embedding entrypoints), and CLI option names & defaults.** v1 (this branch) is maintained in parallel during the transition; once v2 reaches parity it inherits `main`, and v1 ships a final `v1.x.y` tag and stops receiving updates. See the [v2 ROADMAP](https://github.com/clojurewasm/zwasm/blob/zwasm-from-scratch/.dev/ROADMAP.md).
+
 # zwasm
 
 [![CI](https://github.com/clojurewasm/zwasm/actions/workflows/ci.yml/badge.svg)](https://github.com/clojurewasm/zwasm/actions/workflows/ci.yml)
